@@ -1,0 +1,95 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number'
+        required: true
+        default: 'latest'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.set_version.outputs.version }}
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64,  goarch: amd64, goarm: '' }
+          - { arch: arm64,  goarch: arm64, goarm: '' }
+          - { arch: armv7,  goarch: arm,   goarm: '7' }
+          - { arch: armv6,  goarch: arm,   goarm: '6' }
+          - { arch: armv5,  goarch: arm,   goarm: '5' }
+          - { arch: 386,    goarch: 386,   goarm: '' }
+          - { arch: s390x,  goarch: s390x, goarm: '' }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set version
+        id: set_version
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          go build \
+            -trimpath \
+            -ldflags "-s -w -buildid=" \
+            -o mtpgo .
+
+          tar -czf "mtpgo-linux-${{ matrix.arch }}.tar.gz" \
+            mtpgo \
+            mtpgo.service \
+            mtpgo_openrc \
+            config.ini
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-linux-${{ matrix.arch }}
+          path: mtpgo-linux-${{ matrix.arch }}.tar.gz
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          name: Release ${{ needs.build.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
