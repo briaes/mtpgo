@@ -1,0 +1,9 @@
+#!/sbin/openrc-run
+
+name="mtpgo"
+description="Mtproxygo Service"
+command="/bin/sh"
+command_args="-c '/var/mtproxy/mtpgo -c /var/mtproxy/config.ini > /var/mtproxy/log_mtproxy.log'"
+command_background="yes"
+pidfile="/var/run/${RC_SVCNAME}.pid"
+start_stop_daemon_args="--user root:root"

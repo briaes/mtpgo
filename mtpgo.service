@@ -1,0 +1,14 @@
+[Unit]
+Description=Mtpgo Service
+After=network.target
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/var/mtproxy
+ExecStart=/var/mtproxy/mtpgo -c /var/mtproxy/config.ini
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
