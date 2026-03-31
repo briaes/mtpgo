@@ -288,7 +288,9 @@ func main() {
 	go proxy.GetMaskHostCertLen(cfg)
 	go proxy.ClearIPResolvingCache()
 
-	go proxy.UpdateMiddleProxyInfo(cfg)
+	if cfg.UseMiddleProxy {
+		go proxy.UpdateMiddleProxyInfo(cfg)
+	}
 
 	stats.StartMetricsServer(cfg, currentProxyLinks)
 
