@@ -1,16 +1,30 @@
-package main
+package config
 
 import (
 	"encoding/hex"
 	"flag"
-	"strings"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"gopkg.in/ini.v1"
 )
+
+// ── 握手参数常量 ──────────────────────────────────────────────────────────────
+
+const (
+	SkipLen      = 8
+	PrekeyLen    = 32
+	KeyLen       = 32
+	IVLen        = 16
+	HandshakeLen = 64
+	ProtoTagPos  = 56
+	DCIdxPos     = 60
+)
+
+// ── 配置结构体 ────────────────────────────────────────────────────────────────
 
 type Modes struct {
 	Classic bool
@@ -19,11 +33,11 @@ type Modes struct {
 }
 
 type Config struct {
-	Port       int
-	Secrets    [][]byte // 所有 secret，每个 16 字节
-	ADTag      []byte
-	Modes      Modes
-	TLSDomain  string
+	Port    int
+	Secrets [][]byte // 所有 secret，每个 16 字节
+	ADTag   []byte
+	Modes   Modes
+	TLSDomain string
 
 	UseMiddleProxy bool
 	PreferIPv6     bool
@@ -39,25 +53,25 @@ type Config struct {
 	ListenAddrIPv6 string
 	ListenUnixSock string
 
-	MetricsPort          int
-	MetricsListenAddrV4  string
-	MetricsListenAddrV6  string
-	MetricsPrefix        string
-	MetricsWhitelist     []string
-	MetricsExportLinks   bool
+	MetricsPort         int
+	MetricsListenAddrV4 string
+	MetricsListenAddrV6 string
+	MetricsPrefix       string
+	MetricsWhitelist    []string
+	MetricsExportLinks  bool
 
-	ReplayCheckLen  int
-	ClientIPsLen    int
-	StatsPrintPeriod int
-	ProxyInfoUpdatePeriod int
-	GetCertLenPeriod int
-	TGConnectTimeout int
-	TGReadTimeout   int
+	ReplayCheckLen         int
+	ClientIPsLen           int
+	StatsPrintPeriod       int
+	ProxyInfoUpdatePeriod  int
+	GetCertLenPeriod       int
+	TGConnectTimeout       int
+	TGReadTimeout          int
 	ClientHandshakeTimeout int
-	ClientKeepalive int
-	ClientAckTimeout int
-	IgnoreTimeSkew  bool
-	Debug           bool
+	ClientKeepalive        int
+	ClientAckTimeout       int
+	IgnoreTimeSkew         bool
+	Debug                  bool
 
 	TOTGBufsize  interface{} // int 或 [3]int
 	TOCltBufsize interface{}
@@ -65,7 +79,7 @@ type Config struct {
 
 var secretHexRe = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
 
-func loadConfig(path string) (*Config, error) {
+func LoadConfig(path string) (*Config, error) {
 	cfg := &Config{
 		Port:      3256,
 		TLSDomain: "www.google.com",
@@ -79,17 +93,17 @@ func loadConfig(path string) (*Config, error) {
 
 		MetricsPrefix: "mtproxy_",
 
-		ReplayCheckLen:        65536,
-		ClientIPsLen:          131072,
-		StatsPrintPeriod:      60,
-		ProxyInfoUpdatePeriod: 60 * 60,
-		GetCertLenPeriod:      4 * 60 * 60,
-		TGConnectTimeout:      10,
-		TGReadTimeout:         60,
+		ReplayCheckLen:         65536,
+		ClientIPsLen:           131072,
+		StatsPrintPeriod:       60,
+		ProxyInfoUpdatePeriod:  60 * 60,
+		GetCertLenPeriod:       4 * 60 * 60,
+		TGConnectTimeout:       10,
+		TGReadTimeout:          60,
 		ClientHandshakeTimeout: 10,
-		ClientKeepalive:       10,
-		ClientAckTimeout:      10,
-		FastMode:              true,
+		ClientKeepalive:        10,
+		ClientAckTimeout:       10,
+		FastMode:               true,
 
 		TOTGBufsize:  (1 << 14),
 		TOCltBufsize: (1 << 14),
@@ -211,7 +225,7 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func parseArgs() (configPath string) {
+func ParseArgs() (configPath string) {
 	defaultConfig := filepath.Join(filepath.Dir(os.Args[0]), "config.ini")
 
 	var cfgPath string
@@ -228,9 +242,9 @@ func parseArgs() (configPath string) {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "Options:\n")
+		fmt.Fprintf(os.Stderr, "  -h, --help          显示帮助信息\n")
 		fmt.Fprintf(os.Stderr, "  -s, --secret        生成随机 32 位 hex 密钥\n")
 		fmt.Fprintf(os.Stderr, "  -c, --config        指定配置文件路径 (默认: <程序目录>/config.ini)\n")
-		fmt.Fprintf(os.Stderr, "  -h, --help          显示帮助信息\n")
 	}
 
 	flag.Parse()
