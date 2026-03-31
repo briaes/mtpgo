@@ -1,4 +1,4 @@
-package main
+package crypto
 
 import (
 	"crypto/rand"
@@ -8,32 +8,32 @@ import (
 	"sync"
 )
 
-// cryptoRand 是线程安全的加密级随机数生成器
-type cryptoRand struct {
+// CryptoRand 是线程安全的加密级随机数生成器
+type CryptoRand struct {
 	mu  sync.Mutex
-	ctr *aesCTR
+	ctr *AESCTR
 	buf []byte
 }
 
-func newCryptoRand() *cryptoRand {
+func NewCryptoRand() *CryptoRand {
 	key := make([]byte, 32)
 	rand.Read(key)
 	ivBytes := make([]byte, 16)
 	rand.Read(ivBytes)
-	iv := uint128FromBytes(ivBytes)
-	return &cryptoRand{
-		ctr: newAESCTR(key, iv),
+	iv := Uint128FromBytes(ivBytes)
+	return &CryptoRand{
+		ctr: NewAESCTR(key, iv),
 	}
 }
 
-func (r *cryptoRand) Bytes(n int) []byte {
+func (r *CryptoRand) Bytes(n int) []byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	const chunkSize = 512
 	for len(r.buf) < n {
 		plain := make([]byte, chunkSize)
 		rand.Read(plain)
-		r.buf = append(r.buf, r.ctr.encrypt(plain)...)
+		r.buf = append(r.buf, r.ctr.Encrypt(plain)...)
 	}
 	out := make([]byte, n)
 	copy(out, r.buf[:n])
@@ -41,18 +41,18 @@ func (r *cryptoRand) Bytes(n int) []byte {
 	return out
 }
 
-func (r *cryptoRand) Intn(n int) int {
+func (r *CryptoRand) Intn(n int) int {
 	b := r.Bytes(8)
 	val := binary.BigEndian.Uint64(b)
 	return int(val % uint64(n))
 }
 
-func (r *cryptoRand) Choice(s []string) string {
+func (r *CryptoRand) Choice(s []string) string {
 	return s[r.Intn(len(s))]
 }
 
 // GenX25519PublicKey 生成一个模 P 有平方根的随机数（用于 TLS 伪装）
-func (r *cryptoRand) GenX25519PublicKey() []byte {
+func (r *CryptoRand) GenX25519PublicKey() []byte {
 	P := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 255), big.NewInt(19))
 	nBytes := r.Bytes(32)
 	n := new(big.Int).SetBytes(nBytes)
@@ -69,10 +69,11 @@ func (r *cryptoRand) GenX25519PublicKey() []byte {
 	return out
 }
 
-var globalRand = newCryptoRand()
+// GlobalRand 全局加密随机数生成器实例
+var GlobalRand = NewCryptoRand()
 
-// randHex 生成 n 个随机十六进制字符
-func randHex(n int) string {
+// RandHex 生成 n 个随机十六进制字符
+func RandHex(n int) string {
 	const chars = "0123456789abcdef"
 	b := make([]byte, n)
 	for i := range b {
