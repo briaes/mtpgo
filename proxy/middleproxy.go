@@ -43,6 +43,18 @@ func (i *IPInfo) Get() (string, string) {
 
 const MinCertLen = 1024
 
+const TGDatacenterPort = 443
+
+var TGDatacentersV4 = []string{
+	"149.154.175.50", "149.154.167.51", "149.154.175.100",
+	"149.154.167.91", "149.154.171.5",
+}
+
+var TGDatacentersV6 = []string{
+	"2001:b28:f23d:f001::a", "2001:67c:04e8:f002::a", "2001:b28:f23d:f003::a",
+	"2001:67c:04e8:f004::a", "2001:b28:f23f:f005::a",
+}
+
 // 运行时会更新
 var TGMiddleProxiesV4 = map[int][][2]interface{}{
 	1: {{"149.154.175.50", 8888}}, -1: {{"149.154.175.50", 8888}},
@@ -219,44 +231,152 @@ func reverseIP(ip []byte) []byte {
 	return out
 }
 
-func DoMiddleproxyHandshake(protoTag []byte, dcIdx int, clIP string, clPort int, cfg *config.Config) (proto.StreamReader, proto.StreamWriter, error) {
+// ── 直连 TG ───────────────────────────────────────────────────────────────────
+
+var reservedNonceFirstChars = []byte{0xef}
+var reservedNonceBeginnings = [][]byte{
+	{0x48, 0x45, 0x41, 0x44}, {0x50, 0x4F, 0x53, 0x54},
+	{0x47, 0x45, 0x54, 0x20}, {0xee, 0xee, 0xee, 0xee},
+	{0xdd, 0xdd, 0xdd, 0xdd}, {0x16, 0x03, 0x01, 0x02},
+}
+var reservedNonceContinues = [][]byte{{0x00, 0x00, 0x00, 0x00}}
+
+func DoDirectHandshake(protoTag []byte, dcIdx int, decKeyAndIV []byte, cfg *config.Config) (proto.StreamReader, proto.StreamWriter, error) {
+	if dcIdx < 0 {
+		dcIdx = -dcIdx
+	}
+	dcIdx--
+
 	ipv4, ipv6 := MyIPInfo.Get()
-	useIPv6 := ipv6 != "" && (cfg.PreferIPv6 || ipv4 == "")
-
-	var proxies [][2]interface{}
-	if useIPv6 {
-		p, ok := TGMiddleProxiesV6[dcIdx]
-		if !ok {
-			return nil, nil, fmt.Errorf("no v6 proxy for dc %d", dcIdx)
+	var dc string
+	if ipv6 != "" && (cfg.PreferIPv6 || ipv4 == "") {
+		if dcIdx < 0 || dcIdx >= len(TGDatacentersV6) {
+			return nil, nil, fmt.Errorf("invalid dc_idx %d for v6", dcIdx)
 		}
-		proxies = p
+		dc = TGDatacentersV6[dcIdx]
 	} else {
-		p, ok := TGMiddleProxiesV4[dcIdx]
-		if !ok {
-			return nil, nil, fmt.Errorf("no v4 proxy for dc %d", dcIdx)
+		if dcIdx < 0 || dcIdx >= len(TGDatacentersV4) {
+			return nil, nil, fmt.Errorf("invalid dc_idx %d for v4", dcIdx)
 		}
-		proxies = p
+		dc = TGDatacentersV4[dcIdx]
 	}
 
-	chosen := proxies[crypto.GlobalRand.Intn(len(proxies))]
-	host := chosen[0].(string)
-	port := chosen[1].(int)
-
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
+	addr := fmt.Sprintf("%s:%d", dc, TGDatacenterPort)
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("connect to dc %s: %w", addr, err)
 	}
 
-	frameR, frameW, myIP, myPort, err := middleproxyHandshake(conn)
-	if err != nil {
+	// 生成随机 nonce
+	var rnd []byte
+	for {
+		rnd = crypto.GlobalRand.Bytes(config.HandshakeLen)
+		if bytes.IndexByte(reservedNonceFirstChars, rnd[0]) >= 0 {
+			continue
+		}
+		bad := false
+		for _, b := range reservedNonceBeginnings {
+			if bytes.Equal(rnd[:4], b) {
+				bad = true
+				break
+			}
+		}
+		if bad {
+			continue
+		}
+		for _, b := range reservedNonceContinues {
+			if bytes.Equal(rnd[4:8], b) {
+				bad = true
+				break
+			}
+		}
+		if !bad {
+			break
+		}
+	}
+
+	copy(rnd[config.ProtoTagPos:], protoTag)
+
+	if decKeyAndIV != nil {
+		reversed := make([]byte, len(decKeyAndIV))
+		copy(reversed, decKeyAndIV)
+		ReverseBytes(reversed)
+		copy(rnd[config.SkipLen:], reversed[:config.KeyLen+config.IVLen])
+	}
+
+	// dec: reversed slice of rnd[SKIP:SKIP+KEY+IV]
+	decKIV := make([]byte, config.KeyLen+config.IVLen)
+	copy(decKIV, rnd[config.SkipLen:config.SkipLen+config.KeyLen+config.IVLen])
+	ReverseBytes(decKIV)
+	decKey := make([]byte, config.KeyLen)
+	copy(decKey, decKIV[:config.KeyLen])
+	decIV16 := make([]byte, 16)
+	copy(decIV16, decKIV[config.KeyLen:config.KeyLen+config.IVLen])
+	decryptor := crypto.NewAESCTR(decKey, crypto.Uint128FromBytes(decIV16))
+
+	// enc: forward slice of rnd[SKIP:SKIP+KEY+IV]
+	encKey := make([]byte, config.KeyLen)
+	copy(encKey, rnd[config.SkipLen:config.SkipLen+config.KeyLen])
+	encIV16 := make([]byte, 16)
+	copy(encIV16, rnd[config.SkipLen+config.KeyLen:config.SkipLen+config.KeyLen+config.IVLen])
+	encryptor := crypto.NewAESCTR(encKey, crypto.Uint128FromBytes(encIV16))
+
+	rndEnc := make([]byte, len(rnd))
+	copy(rndEnc, rnd[:config.ProtoTagPos])
+	// encryptor 加密整个 rnd，取 ProtoTagPos 之后的部分
+	encryptedRnd := encryptor.Encrypt(rnd)
+	copy(rndEnc[config.ProtoTagPos:], encryptedRnd[config.ProtoTagPos:])
+
+	if _, err := conn.Write(rndEnc); err != nil {
 		conn.Close()
 		return nil, nil, err
 	}
 
-	proxyR := &proxyReqReader{upstream: frameR}
-	proxyW := newProxyReqWriter(frameW, clIP, clPort, myIP, myPort, protoTag, cfg)
+	r := &proto.TCPReader{Conn: conn}
+	w := &proto.TCPWriter{Conn: conn}
+	return &proto.CryptoReader{Upstream: r, Decryptor: decryptor, BlockSize: 1},
+		&proto.CryptoWriter{Upstream: w, Encryptor: encryptor, BlockSize: 1}, nil
+}
 
-	return proxyR, proxyW, nil
+// ── 中间代理出站 ──────────────────────────────────────────────────────────────
+func DoMiddleproxyHandshake(protoTag []byte, dcIdx int, clIP string, clPort int, cfg *config.Config) (proto.StreamReader, proto.StreamWriter, error) {
+    ipv4, ipv6 := MyIPInfo.Get()
+    useIPv6 := ipv6 != "" && (cfg.PreferIPv6 || ipv4 == "")
+
+    var proxies [][2]interface{}
+    if useIPv6 {
+        p, ok := TGMiddleProxiesV6[dcIdx]
+        if !ok {
+            return nil, nil, fmt.Errorf("no v6 proxy for dc %d", dcIdx)
+        }
+        proxies = p
+    } else {
+        p, ok := TGMiddleProxiesV4[dcIdx]
+        if !ok {
+            return nil, nil, fmt.Errorf("no v4 proxy for dc %d", dcIdx)
+        }
+        proxies = p
+    }
+
+    chosen := proxies[crypto.GlobalRand.Intn(len(proxies))]
+    host := chosen[0].(string)
+    port := chosen[1].(int)
+
+    conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
+    if err != nil {
+        return nil, nil, err
+    }
+
+    frameR, frameW, myIP, myPort, err := middleproxyHandshake(conn)
+    if err != nil {
+        conn.Close()
+        return nil, nil, err
+    }
+
+    proxyR := &proxyReqReader{upstream: frameR}
+    proxyW := newProxyReqWriter(frameW, clIP, clPort, myIP, myPort, protoTag, cfg)
+
+    return proxyR, proxyW, nil
 }
 
 // ── ProxyReq 流（包装中间代理协议）────────────────────────────────────────────
