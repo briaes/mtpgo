@@ -1,9 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
-	"context"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +13,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"mtproxy/config"
+	"mtproxy/crypto"
+	"mtproxy/proxy"
+	"mtproxy/stats"
 )
 
 // ── 日志 ──────────────────────────────────────────────────────────────────────
@@ -34,15 +39,8 @@ func logf(format string, args ...interface{}) {
 	fmt.Fprintf(logWriter, format, args...)
 }
 
-func dbgf(cfg *Config, format string, args ...interface{}) {
-	if cfg != nil && cfg.Debug {
-		logf(format, args...)
-	}
-}
-
 // ── 获取公网 IP ───────────────────────────────────────────────────────────────
 
-// getNetIface 获取第一个物理网卡名（eth/ens/enp 开头）
 func getNetIface() string {
 	entries, err := os.ReadDir("/sys/class/net")
 	if err != nil {
@@ -59,8 +57,6 @@ func getNetIface() string {
 	return ""
 }
 
-// newHTTPClient 创建强制使用指定 IP 版本和网卡的 HTTP 客户端
-// network: "tcp4" 强制 IPv4，"tcp6" 强制 IPv6
 func newHTTPClient(network, iface string) *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	if iface != "" {
@@ -81,7 +77,6 @@ func newHTTPClient(network, iface string) *http.Client {
 	}
 }
 
-// getIPFromURL 请求 URL 并返回合法 IP，失败返回空字符串
 func getIPFromURL(client *http.Client, url string) string {
 	resp, err := client.Get(url)
 	if err != nil {
@@ -102,7 +97,6 @@ func getIPFromURL(client *http.Client, url string) string {
 	return result
 }
 
-// getFirstIP 依次尝试 URL 列表，返回第一个成功的 IP
 func getFirstIP(client *http.Client, urls []string) string {
 	for _, url := range urls {
 		if ip := getIPFromURL(client, url); ip != "" {
@@ -112,10 +106,9 @@ func getFirstIP(client *http.Client, urls []string) string {
 	return ""
 }
 
-func initIPInfo(cfg *Config) {
+func initIPInfo(cfg *config.Config) {
 	iface := getNetIface()
 
-	// 同一套 URL，分别强制走 IPv4/IPv6 网络连接
 	ipURLs := []string{
 		"http://ip.gs",
 		"http://ip.sb",
@@ -131,12 +124,11 @@ func initIPInfo(cfg *Config) {
 	ipv4 := getFirstIP(clientV4, ipURLs)
 	ipv6 := getFirstIP(clientV6, ipURLs)
 
-	// 额外验证 IPv6 格式（包含 : 才是合法 IPv6）
 	if ipv6 != "" && !strings.Contains(ipv6, ":") {
 		ipv6 = ""
 	}
 
-	myIPInfo.Set(ipv4, ipv6)
+	proxy.MyIPInfo.Set(ipv4, ipv6)
 
 	if ipv6 != "" && (cfg.PreferIPv6 || ipv4 == "") {
 		logf("IPv6 found, using it for external communication\n")
@@ -148,10 +140,8 @@ func initIPInfo(cfg *Config) {
 
 // ── 打印代理链接 ──────────────────────────────────────────────────────────────
 
-var currentProxyLinks []map[string]string
-
-func printTGInfo(cfg *Config) []map[string]string {
-	ipv4, ipv6 := myIPInfo.Get()
+func printTGInfo(cfg *config.Config) []map[string]string {
+	ipv4, ipv6 := proxy.MyIPInfo.Get()
 	var ipAddrs []string
 
 	if cfg.MyDomain != "" {
@@ -204,7 +194,7 @@ func printTGInfo(cfg *Config) []map[string]string {
 
 		if defaultSecrets[secretHex] {
 			logf("The default secret %s is used, this is not recommended\n", secretHex)
-			rnd := globalRand.Bytes(16)
+			rnd := crypto.GlobalRand.Bytes(16)
 			logf("You can change it to this random secret: %s\n", hex.EncodeToString(rnd))
 			printDefault = true
 		}
@@ -223,7 +213,7 @@ func printTGInfo(cfg *Config) []map[string]string {
 
 // ── 服务器启动 ────────────────────────────────────────────────────────────────
 
-func startServers(cfg *Config) []io.Closer {
+func startServers(cfg *config.Config) []io.Closer {
 	var listeners []io.Closer
 
 	if cfg.ListenAddrIPv4 != "" {
@@ -264,13 +254,13 @@ func startServers(cfg *Config) []io.Closer {
 	return listeners
 }
 
-func acceptLoop(ln net.Listener, cfg *Config) {
+func acceptLoop(ln net.Listener, cfg *config.Config) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go handleClientWrapper(conn, cfg)
+		go proxy.HandleClientWrapper(conn, cfg)
 	}
 }
 
@@ -278,27 +268,29 @@ func acceptLoop(ln net.Listener, cfg *Config) {
 
 func main() {
 	setupLogger()
-	configPath := parseArgs()
+	proxy.SetLogger(logWriter)
 
-	cfg, err := loadConfig(configPath)
+	configPath := config.ParseArgs()
+
+	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		logf("配置加载失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	usedHandshakes = newReplayCache(cfg.ReplayCheckLen)
-	clientIPs = newReplayCache(cfg.ClientIPsLen)
+	proxy.UsedHandshakes = proxy.NewReplayCache(cfg.ReplayCheckLen)
+	proxy.ClientIPs = proxy.NewReplayCache(cfg.ClientIPsLen)
 
 	initIPInfo(cfg)
-	currentProxyLinks = printTGInfo(cfg)
+	currentProxyLinks := printTGInfo(cfg)
 
-	go statsPrinter(cfg)
-	go getMaskHostCertLen(cfg)
-	go clearIPResolvingCache()
+	go stats.StatsPrinter(cfg, logf)
+	go proxy.GetMaskHostCertLen(cfg)
+	go proxy.ClearIPResolvingCache()
 
-	go updateMiddleProxyInfo(cfg)
+	go proxy.UpdateMiddleProxyInfo(cfg)
 
-	startMetricsServer(cfg, currentProxyLinks)
+	stats.StartMetricsServer(cfg, currentProxyLinks)
 
 	listeners := startServers(cfg)
 	if len(listeners) == 0 {
@@ -310,13 +302,13 @@ func main() {
 	signal.Notify(reloadCh, syscall.SIGUSR2)
 	go func() {
 		for range reloadCh {
-			newCfg, err := loadConfig(configPath)
+			newCfg, err := config.LoadConfig(configPath)
 			if err != nil {
 				logf("配置重载失败: %v\n", err)
 				continue
 			}
 			*cfg = *newCfg
-			usedHandshakes = newReplayCache(cfg.ReplayCheckLen)
+			proxy.UsedHandshakes = proxy.NewReplayCache(cfg.ReplayCheckLen)
 			currentProxyLinks = printTGInfo(cfg)
 			logf("Config reloaded\n")
 		}
