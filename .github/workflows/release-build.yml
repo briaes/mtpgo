@@ -50,10 +50,9 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: 0
         run: |
-          go build ./cmd/mtpgo/ \
-            -trimpath \
+          go build -trimpath \
             -ldflags "-s -w -buildid=" \
-            -o mtpgo .
+            -o mtpgo ./cmd/mtpgo/
 
           tar -czf "mtpgo-linux-${{ matrix.arch }}.tar.gz" \
             mtpgo \
