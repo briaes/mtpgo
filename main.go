@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -59,46 +60,74 @@ func getNetIface() string {
 }
 
 // getIPFromURL 通过指定网卡获取 IP，iface 为空则不绑定
-func getIPFromURL(url, iface string) string {
+func getIPFromURL(url, iface string, network string) string {
 	var transport *http.Transport
-	if iface != "" {
-		dialer := &net.Dialer{
-			Timeout: 5 * time.Second,
-			Control: func(network, address string, c syscall.RawConn) error {
-				return c.Control(func(fd uintptr) {
-					syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET,
-						syscall.SO_BINDTODEVICE, iface)
-				})
-			},
-		}
-		transport = &http.Transport{DialContext: dialer.DialContext}
+	
+	// 创建指定网络类型的 dialer
+	dialer := &net.Dialer{
+		Timeout: 5 * time.Second,
 	}
+	
+	// 绑定到指定网卡
+	if iface != "" {
+		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET,
+					syscall.SO_BINDTODEVICE, iface)
+			})
+		}
+	}
+	
+	// 根据指定的网络类型创建 Transport
+	transport = &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			// 使用指定的网络类型 (tcp4 或 tcp6)
+			return dialer.DialContext(ctx, network, addr)
+		},
+	}
+	
 	client := &http.Client{
 		Timeout:   5 * time.Second,
 		Transport: transport,
 	}
+	
 	resp, err := client.Get(url)
 	if err != nil {
 		return ""
 	}
 	defer resp.Body.Close()
+	
 	if resp.StatusCode != 200 {
 		return ""
 	}
+	
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return ""
 	}
+	
 	result := strings.TrimSpace(string(body))
-	if net.ParseIP(result) == nil {
+	
+	// 验证是否为有效的 IP 地址
+	ip := net.ParseIP(result)
+	if ip == nil {
 		return ""
 	}
+	
+	// 根据网络类型验证 IP 版本
+	if network == "tcp4" && ip.To4() == nil {
+		return "" // 要求 IPv4 但得到的是 IPv6
+	}
+	if network == "tcp6" && ip.To4() != nil {
+		return "" // 要求 IPv6 但得到的是 IPv4
+	}
+	
 	return result
 }
 
-func getFirstIP(urls []string, iface string) string {
+func getFirstIP(urls []string, iface string, network string) string {
 	for _, url := range urls {
-		if ip := getIPFromURL(url, iface); ip != "" {
+		if ip := getIPFromURL(url, iface, network); ip != "" {
 			return ip
 		}
 	}
@@ -108,20 +137,25 @@ func getFirstIP(urls []string, iface string) string {
 func initIPInfo(cfg *Config) {
 	iface := getNetIface()
 
+	// IPv4: 使用 tcp4 网络，强制使用 IPv4 连接
 	ipv4 := getFirstIP([]string{
 		"http://ip.gs",
 		"http://ip.sb",
 		"http://ident.me",
 		"http://ifconfig.me",
 		"http://icanhazip.com",
-	}, iface)
+	}, iface, "tcp4")
+	
+	// IPv6: 使用 tcp6 网络，强制使用 IPv6 连接
+	// 使用支持 IPv6 的服务
 	ipv6 := getFirstIP([]string{
 		"http://ip.gs",
 		"http://ip.sb",
 		"http://ident.me",
 		"http://ifconfig.me",
 		"http://icanhazip.com",
-	}, iface)
+	}, iface, "tcp6")
+	
 	if ipv6 != "" && !strings.Contains(ipv6, ":") {
 		ipv6 = ""
 	}
