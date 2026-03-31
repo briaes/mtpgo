@@ -35,11 +35,6 @@ type Config struct {
 	MaskPort int
 	MyDomain string
 
-	Socks5Host string
-	Socks5Port int
-	Socks5User string
-	Socks5Pass string
-
 	ListenAddrIPv4 string
 	ListenAddrIPv6 string
 	ListenUnixSock string
@@ -54,7 +49,6 @@ type Config struct {
 	ReplayCheckLen  int
 	ClientIPsLen    int
 	StatsPrintPeriod int
-	GetTimePeriod   int
 	ProxyInfoUpdatePeriod int
 	GetCertLenPeriod int
 	TGConnectTimeout int
@@ -88,7 +82,6 @@ func loadConfig(path string) (*Config, error) {
 		ReplayCheckLen:        65536,
 		ClientIPsLen:          131072,
 		StatsPrintPeriod:      60,
-		GetTimePeriod:         10 * 60,
 		ProxyInfoUpdatePeriod: 60 * 60,
 		GetCertLenPeriod:      4 * 60 * 60,
 		TGConnectTimeout:      10,
@@ -142,18 +135,6 @@ func loadConfig(path string) (*Config, error) {
 	if key, err2 := sec.GetKey("DEBUG"); err2 == nil {
 		cfg.Debug, _ = key.Bool()
 	}
-	if key, err2 := sec.GetKey("SOCKS5_HOST"); err2 == nil {
-		cfg.Socks5Host = key.String()
-	}
-	if key, err2 := sec.GetKey("SOCKS5_PORT"); err2 == nil {
-		cfg.Socks5Port, _ = key.Int()
-	}
-	if key, err2 := sec.GetKey("SOCKS5_USER"); err2 == nil {
-		cfg.Socks5User = key.String()
-	}
-	if key, err2 := sec.GetKey("SOCKS5_PASS"); err2 == nil {
-		cfg.Socks5Pass = key.String()
-	}
 	if key, err2 := sec.GetKey("LISTEN_ADDR_IPV4"); err2 == nil {
 		cfg.ListenAddrIPv4 = key.String()
 	}
@@ -187,9 +168,6 @@ func loadConfig(path string) (*Config, error) {
 	if key, err2 := sec.GetKey("STATS_PRINT_PERIOD"); err2 == nil {
 		cfg.StatsPrintPeriod, _ = key.Int()
 	}
-	if key, err2 := sec.GetKey("GET_TIME_PERIOD"); err2 == nil {
-		cfg.GetTimePeriod, _ = key.Int()
-	}
 	if key, err2 := sec.GetKey("AD_TAG"); err2 == nil {
 		tag, e := hex.DecodeString(key.String())
 		if e == nil {
@@ -208,28 +186,14 @@ func loadConfig(path string) (*Config, error) {
 		cfg.Modes.TLS, _ = key.Bool()
 	}
 
-	// 收集所有独立 secret 变量（32位hex字符串）
-	reservedKeys := map[string]bool{
-		"PORT": true, "AD_TAG": true, "USE_MIDDLE_PROXY": true, "PREFER_IPV6": true,
-		"FAST_MODE": true, "PROXY_PROTOCOL": true, "TLS_DOMAIN": true, "MASK": true,
-		"MASK_HOST": true, "MY_DOMAIN": true, "MASK_PORT": true, "SOCKS5_HOST": true,
-		"SOCKS5_PORT": true, "SOCKS5_USER": true, "SOCKS5_PASS": true,
-		"LISTEN_ADDR_IPV4": true, "LISTEN_ADDR_IPV6": true, "LISTEN_UNIX_SOCK": true,
-		"METRICS_PORT": true, "METRICS_LISTEN_ADDR_IPV4": true, "METRICS_LISTEN_ADDR_IPV6": true,
-		"METRICS_PREFIX": true, "METRICS_EXPORT_LINKS": true, "METRICS_WHITELIST": true,
-		"REPLAY_CHECK_LEN": true, "CLIENT_IPS_LEN": true, "STATS_PRINT_PERIOD": true,
-		"GET_TIME_PERIOD": true, "MODES_CLASSIC": true, "MODES_SECURE": true, "MODES_TLS": true,
-		"IGNORE_TIME_SKEW": true,
-	}
-	for _, key := range sec.Keys() {
-		name := key.Name()
-		val := key.String()
-		if reservedKeys[name] {
-			continue
-		}
-		if secretHexRe.MatchString(val) {
-			b, _ := hex.DecodeString(val)
-			cfg.Secrets = append(cfg.Secrets, b)
+	// 读取 SECRET（支持逗号分隔多个 32 位 hex 字符串）
+	if key, err2 := sec.GetKey("SECRET"); err2 == nil {
+		for _, s := range strings.Split(key.String(), ",") {
+			s = strings.TrimSpace(s)
+			if secretHexRe.MatchString(s) {
+				b, _ := hex.DecodeString(s)
+				cfg.Secrets = append(cfg.Secrets, b)
+			}
 		}
 	}
 	if len(cfg.Secrets) == 0 {
@@ -242,10 +206,7 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.MaskHost == "" {
 		cfg.MaskHost = cfg.TLSDomain
 	}
-	cfg.UseMiddleProxy = len(cfg.ADTag) == 16
-	if cfg.Socks5Host != "" && cfg.Socks5Port != 0 {
-		cfg.UseMiddleProxy = false
-	}
+	cfg.UseMiddleProxy = true
 
 	return cfg, nil
 }
