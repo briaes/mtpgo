@@ -220,7 +220,7 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.MaskHost == "" {
 		cfg.MaskHost = cfg.TLSDomain
 	}
-	cfg.UseMiddleProxy = true
+	cfg.UseMiddleProxy = len(cfg.ADTag) == 16
 
 	return cfg, nil
 }
