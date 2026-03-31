@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-var disableMiddleProxy bool
-
 func pipeReaderToWriter(ctx context.Context, rd streamReader, wr streamWriter,
 	secretHex string, bufSize int, isUpstream bool) {
 
@@ -108,24 +106,13 @@ func handleClient(conn net.Conn, cfg *Config) {
 	stat.AddCurrConnects(1)
 	defer stat.AddCurrConnects(-1)
 
-	connectDirect := !cfg.UseMiddleProxy || disableMiddleProxy
-
 	var tgReader streamReader
 	var tgWriter streamWriter
 
-	if connectDirect {
-		var decKeyIV []byte
-		if cfg.FastMode {
-			decKeyIV = hsResult.encKeyIV
-		}
-		dbgf(cfg, "[DEBUG] connecting to TG dc=%d fastMode=%v\n", hsResult.dcIdx, cfg.FastMode)
-		tgReader, tgWriter, err = doDirectHandshake(hsResult.protoTag, hsResult.dcIdx, decKeyIV, cfg)
-	} else {
-		clAddr := conn.RemoteAddr().(*net.TCPAddr)
-		dbgf(cfg, "[DEBUG] connecting via middleproxy dc=%d\n", hsResult.dcIdx)
-		tgReader, tgWriter, err = doMiddleproxyHandshake(hsResult.protoTag, hsResult.dcIdx,
-			clAddr.IP.String(), clAddr.Port, cfg)
-	}
+	clAddr := conn.RemoteAddr().(*net.TCPAddr)
+	dbgf(cfg, "[DEBUG] connecting via middleproxy dc=%d\n", hsResult.dcIdx)
+	tgReader, tgWriter, err = doMiddleproxyHandshake(hsResult.protoTag, hsResult.dcIdx,
+		clAddr.IP.String(), clAddr.Port, cfg)
 
 	if err != nil {
 		dbgf(cfg, "[DEBUG] TG connect failed: %v\n", err)
@@ -137,26 +124,15 @@ func handleClient(conn net.Conn, cfg *Config) {
 	cltReader := hsResult.reader
 	cltWriter := hsResult.writer
 
-	if connectDirect && cfg.FastMode {
-		if cr, ok := tgReader.(*cryptoReader); ok {
-			cr.decryptor = &noopCipher{}
-		}
-		if cw, ok := cltWriter.(*cryptoWriter); ok {
-			cw.encryptor = &noopCipher{}
-		}
-	}
-
-	if !connectDirect {
-		if bytes.Equal(hsResult.protoTag, ProtoTagAbridged) {
-			cltReader = &mtprotoCompactReader{upstream: cltReader}
-			cltWriter = &mtprotoCompactWriter{upstream: cltWriter}
-		} else if bytes.Equal(hsResult.protoTag, ProtoTagIntermediate) {
-			cltReader = &mtprotoIntermediateReader{upstream: cltReader}
-			cltWriter = &mtprotoIntermediateWriter{upstream: cltWriter}
-		} else if bytes.Equal(hsResult.protoTag, ProtoTagSecure) {
-			cltReader = &mtprotoSecureReader{upstream: cltReader}
-			cltWriter = &mtprotoSecureWriter{upstream: cltWriter}
-		}
+	if bytes.Equal(hsResult.protoTag, ProtoTagAbridged) {
+		cltReader = &mtprotoCompactReader{upstream: cltReader}
+		cltWriter = &mtprotoCompactWriter{upstream: cltWriter}
+	} else if bytes.Equal(hsResult.protoTag, ProtoTagIntermediate) {
+		cltReader = &mtprotoIntermediateReader{upstream: cltReader}
+		cltWriter = &mtprotoIntermediateWriter{upstream: cltWriter}
+	} else if bytes.Equal(hsResult.protoTag, ProtoTagSecure) {
+		cltReader = &mtprotoSecureReader{upstream: cltReader}
+		cltWriter = &mtprotoSecureWriter{upstream: cltWriter}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -185,11 +161,6 @@ func handleClientWrapper(conn net.Conn, cfg *Config) {
 	}()
 	handleClient(conn, cfg)
 }
-
-type noopCipher struct{}
-
-func (n *noopCipher) encrypt(data []byte) []byte { return data }
-func (n *noopCipher) decrypt(data []byte) []byte { return data }
 
 func setKeepalive(conn net.Conn, interval int) {
 	if tc, ok := conn.(*net.TCPConn); ok {
