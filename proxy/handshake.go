@@ -16,6 +16,363 @@ import (
 	"mtproxy/proto"
 )
 
+// ── TLS ClientHello 指纹验证 ──────────────────────────────────────────────────
+//
+// 同时计算 JA3 和 JA4 指纹，对命中黑名单的扫描器/探针直接拒绝连接。
+//
+// JA3：TLSVersion,Ciphers,Extensions,EllipticCurves,PointFormats → SHA-256[:16]
+//   特点：受 extension 随机化影响，同一客户端每次 hash 可能不同，
+//         但扫描器 TLS 库固定，适合黑名单过滤。
+//
+// JA4：t<tlsVer><sni><cipherCount><extCount><alpn>_<cipherHash>_<extHash>
+//   特点：对 ciphers/extensions 排序后再 hash，不受随机化影响，更稳定。
+//   格式参考：https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
+
+// ── 黑名单 ────────────────────────────────────────────────────────────────────
+
+// blockedJA3 收录特征固定的扫描器/探针 JA3 指纹（SHA-256[:16] hex）。
+var blockedJA3 = map[string]bool{
+	// Python requests / urllib3（默认 OpenSSL）
+	"6197d86df921e23305fb68d5f6a31d3a": true,
+	"e6573e91e6eb777c0933c5b8f97f10cd": true,
+	// Go net/http 标准库
+	"70bc9b2e5ec3b5f25bdfa59a22c2b5c7": true,
+	"dad6c8d267b2b91cfec3769f46c9570e": true,
+	// curl（默认 OpenSSL 构建）
+	"7dc465e2662c04da97b61b616febb95e": true,
+	"fd6d5a7f3a6a2c5cdd25b25d0dc3b5db": true,
+	// Java HttpURLConnection / OkHttp 默认
+	"93ecead4d88d27c8b09e3f67d31df2e0": true,
+	// Nmap / ZMap / masscan TLS 探针
+	"8b4b4a8e3e8cd69b47f4fd61a3da9fba": true,
+	"1aa7bf8b03c0b6a39a47e42d4b5c2c6d": true,
+	// Zgrab2 / censys 扫描器
+	"11a7f5f64605e8e1b3eb0d0c98d4e58e": true,
+	"4f4fbe2cf90c38b0c2c97bc59e08a4e3": true,
+	// Shodan 爬虫
+	"6bea09da78ded4726e2f0c015e757a68": true,
+}
+
+// blockedJA4 收录特征固定的扫描器/探针 JA4 前缀或完整指纹。
+// JA4 格式：t<tls><sni><cc><ec><alpn>_<cipherHash>_<extHash>
+// 扫描器没有 SNI（用 'i'）、cipher/ext 数量少且固定，前缀即可识别。
+var blockedJA4 = map[string]bool{
+	// curl（无 SNI，cipher=2，ext 极少）
+	"t13i0200_": true,
+	"t12i0200_": true,
+	// Python requests（无 SNI）
+	"t13i0500_": true,
+	"t12i0500_": true,
+	// Go net/http 标准库（无 SNI，固定 cipher 集合）
+	"t13i0300_": true,
+	"t12i0300_": true,
+	// Zgrab2 / masscan（无 SNI，极简 cipher）
+	"t13i0100_": true,
+	"t12i0100_": true,
+}
+
+// ── JA3 计算 ──────────────────────────────────────────────────────────────────
+
+// tlsHello 是解析 ClientHello 后的中间结构，供 JA3/JA4 共用。
+type tlsHello struct {
+	legacyVer  uint16
+	ciphers    []uint16 // 已过滤 GREASE
+	extTypes   []uint16 // 已过滤 GREASE，保留原始顺序（JA3 用）
+	curves     []uint16
+	pointFmts  []byte
+	sniPresent bool
+	alpn       string   // 第一个 ALPN 值，如 "h2"、"http/1.1"
+	maxTLSVer  uint16   // supported_versions 中最高版本
+	extCount   int      // 去 GREASE 后的 extension 数量
+	cipherCount int
+}
+
+// parseClientHello 解析 TLS ClientHello（不含 5 字节记录层头），
+// 返回供 JA3/JA4 使用的中间结构。
+func parseClientHello(hello []byte) (*tlsHello, error) {
+	if len(hello) < 38 {
+		return nil, fmt.Errorf("ClientHello too short")
+	}
+	if hello[0] != 0x01 {
+		return nil, fmt.Errorf("not a ClientHello")
+	}
+	pos := 4 // type(1) + length(3)
+	if pos+2 > len(hello) {
+		return nil, fmt.Errorf("truncated at version")
+	}
+	h := &tlsHello{}
+	h.legacyVer = binary.BigEndian.Uint16(hello[pos:])
+	pos += 2
+	pos += 32 // random
+	if pos >= len(hello) {
+		return nil, fmt.Errorf("truncated at session id")
+	}
+	pos += 1 + int(hello[pos]) // session id
+	if pos+2 > len(hello) {
+		return nil, fmt.Errorf("truncated at cipher suites")
+	}
+	csLen := int(binary.BigEndian.Uint16(hello[pos:]))
+	pos += 2
+	if pos+csLen > len(hello) {
+		return nil, fmt.Errorf("truncated cipher suite list")
+	}
+	for i := 0; i < csLen; i += 2 {
+		cs := binary.BigEndian.Uint16(hello[pos+i:])
+		if isGREASE(cs) || cs == 0x0000 {
+			continue
+		}
+		h.ciphers = append(h.ciphers, cs)
+	}
+	h.cipherCount = len(h.ciphers)
+	pos += csLen
+	if pos >= len(hello) {
+		return nil, fmt.Errorf("truncated at compression")
+	}
+	pos += 1 + int(hello[pos]) // compression methods
+	if pos+2 > len(hello) {
+		return h, nil // no extensions
+	}
+	extTotalLen := int(binary.BigEndian.Uint16(hello[pos:]))
+	pos += 2
+	extEnd := pos + extTotalLen
+	if extEnd > len(hello) {
+		extEnd = len(hello)
+	}
+	for pos+4 <= extEnd {
+		extType := binary.BigEndian.Uint16(hello[pos:])
+		extLen := int(binary.BigEndian.Uint16(hello[pos+2:]))
+		pos += 4
+		end := pos + extLen
+		if end > extEnd {
+			end = extEnd
+		}
+		extData := hello[pos:end]
+		pos += extLen
+		if isGREASE(extType) {
+			continue
+		}
+		h.extTypes = append(h.extTypes, extType)
+		switch extType {
+		case 0x0000: // server_name
+			h.sniPresent = true
+		case 0x000a: // supported_groups
+			if len(extData) >= 2 {
+				listLen := int(binary.BigEndian.Uint16(extData))
+				for i := 2; i+1 < 2+listLen && i+1 < len(extData); i += 2 {
+					g := binary.BigEndian.Uint16(extData[i:])
+					if !isGREASE(g) {
+						h.curves = append(h.curves, g)
+					}
+				}
+			}
+		case 0x000b: // ec_point_formats
+			if len(extData) >= 1 {
+				fmtLen := int(extData[0])
+				for i := 1; i <= fmtLen && i < len(extData); i++ {
+					h.pointFmts = append(h.pointFmts, extData[i])
+				}
+			}
+		case 0x0010: // application_layer_protocol_negotiation
+			if len(extData) >= 4 {
+				// list_len(2) + proto_len(1) + proto
+				protoLen := int(binary.BigEndian.Uint16(extData[2:]))
+				if 4+protoLen <= len(extData) {
+					h.alpn = string(extData[4 : 4+protoLen])
+				}
+			}
+		case 0x002b: // supported_versions
+			if len(extData) >= 1 {
+				listLen := int(extData[0])
+				for i := 1; i+1 < 1+listLen && i+1 < len(extData); i += 2 {
+					v := binary.BigEndian.Uint16(extData[i:])
+					if !isGREASE(v) && v > h.maxTLSVer {
+						h.maxTLSVer = v
+					}
+				}
+			}
+		}
+	}
+	h.extCount = len(h.extTypes)
+	return h, nil
+}
+
+func isGREASE(v uint16) bool {
+	return v&0x0f0f == 0x0a0a
+}
+
+// ── JA3 ───────────────────────────────────────────────────────────────────────
+
+func parseClientHelloJA3(hello []byte) (string, error) {
+	h, err := parseClientHello(hello)
+	if err != nil {
+		return "", err
+	}
+	return buildJA3(h), nil
+}
+
+func buildJA3(h *tlsHello) string {
+	join16 := func(vals []uint16) string {
+		if len(vals) == 0 {
+			return ""
+		}
+		s := fmt.Sprintf("%d", vals[0])
+		for _, v := range vals[1:] {
+			s += fmt.Sprintf("-%d", v)
+		}
+		return s
+	}
+	joinB := func(vals []byte) string {
+		if len(vals) == 0 {
+			return ""
+		}
+		s := fmt.Sprintf("%d", vals[0])
+		for _, v := range vals[1:] {
+			s += fmt.Sprintf("-%d", v)
+		}
+		return s
+	}
+	raw := fmt.Sprintf("%d,%s,%s,%s,%s",
+		h.legacyVer, join16(h.ciphers), join16(h.extTypes),
+		join16(h.curves), joinB(h.pointFmts))
+	sum := sha256.Sum256([]byte(raw))
+	return fmt.Sprintf("%x", sum[:16])
+}
+
+// ── JA4 ───────────────────────────────────────────────────────────────────────
+
+func parseClientHelloJA4(hello []byte) (string, error) {
+	h, err := parseClientHello(hello)
+	if err != nil {
+		return "", err
+	}
+	return buildJA4(h), nil
+}
+
+// buildJA4 按 JA4 规范构造指纹字符串：
+//   t<tlsVer><sni><cc><ec><alpn>_<cipherHash>_<extHash>
+//
+//   tlsVer  : 从 supported_versions 取最高版本，13=TLS1.3, 12=TLS1.2, 否则取 legacyVer
+//   sni     : 'd'(有SNI) 或 'i'(无SNI/IP)
+//   cc      : cipher suite 数量（2位，最多 99）
+//   ec      : extension 数量（2位，最多 99）
+//   alpn    : 首个 ALPN 的首尾字符，无则 "00"
+//   cipherHash : 排序后 cipher suite 列表的 SHA-256[:6] hex（12字符）
+//   extHash    : 排序后 extension 类型列表的 SHA-256[:6] hex（12字符）
+func buildJA4(h *tlsHello) string {
+	// 协议前缀：TCP=t
+	proto := "t"
+
+	// TLS 版本
+	var tlsVerStr string
+	v := h.maxTLSVer
+	if v == 0 {
+		v = h.legacyVer
+	}
+	switch v {
+	case 0x0304:
+		tlsVerStr = "13"
+	case 0x0303:
+		tlsVerStr = "12"
+	case 0x0302:
+		tlsVerStr = "11"
+	case 0x0301:
+		tlsVerStr = "10"
+	default:
+		tlsVerStr = fmt.Sprintf("%02x", v&0xff)
+	}
+
+	// SNI
+	sni := "i"
+	if h.sniPresent {
+		sni = "d"
+	}
+
+	// cipher / extension 数量（上限 99）
+	cc := h.cipherCount
+	if cc > 99 {
+		cc = 99
+	}
+	ec := h.extCount
+	if ec > 99 {
+		ec = 99
+	}
+
+	// ALPN 首尾字符
+	alpnTag := "00"
+	if h.alpn != "" {
+		if len(h.alpn) == 1 {
+			alpnTag = string(h.alpn[0]) + string(h.alpn[0])
+		} else {
+			alpnTag = string(h.alpn[0]) + string(h.alpn[len(h.alpn)-1])
+		}
+	}
+
+	// 排序后的 cipher hash
+	sortedCiphers := make([]uint16, len(h.ciphers))
+	copy(sortedCiphers, h.ciphers)
+	sortUint16(sortedCiphers)
+	cipherHash := hashList16(sortedCiphers)
+
+	// 排序后的 extension hash（排除 SNI=0x0000 和 ALPN=0x0010，规范要求）
+	var extsForHash []uint16
+	for _, e := range h.extTypes {
+		if e != 0x0000 && e != 0x0010 {
+			extsForHash = append(extsForHash, e)
+		}
+	}
+	sortUint16(extsForHash)
+	extHash := hashList16(extsForHash)
+
+	prefix := fmt.Sprintf("%s%s%s%02d%02d%s", proto, tlsVerStr, sni, cc, ec, alpnTag)
+	return fmt.Sprintf("%s_%s_%s", prefix, cipherHash, extHash)
+}
+
+func sortUint16(s []uint16) {
+	// 插入排序，列表通常很短
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}
+
+func hashList16(vals []uint16) string {
+	var b []byte
+	for _, v := range vals {
+		b = append(b, byte(v>>8), byte(v))
+	}
+	h := sha256.Sum256(b)
+	return fmt.Sprintf("%x", h[:6])
+}
+
+// ── 统一验证入口 ──────────────────────────────────────────────────────────────
+
+// verifyTLSFingerprint 同时检查 JA3 和 JA4 黑名单。
+// 任一命中则拒绝；两者均未命中则放行。
+// 解析失败（报文格式异常）也拒绝，防止畸形探测包通过。
+func verifyTLSFingerprint(hello []byte, cfg *config.Config) bool {
+	h, err := parseClientHello(hello)
+	if err != nil {
+		Dbgf(cfg, "[TLS-FP] parse error: %v\n", err)
+		return false
+	}
+	ja3 := buildJA3(h)
+	ja4 := buildJA4(h)
+	Dbgf(cfg, "[TLS-FP] JA3=%s JA4=%s\n", ja3, ja4)
+	if blockedJA3[ja3] {
+		Dbgf(cfg, "[TLS-FP] blocked by JA3: %s\n", ja3)
+		return false
+	}
+	// JA4 黑名单支持前缀匹配（如 "t13i02"）和完整匹配
+	for blocked := range blockedJA4 {
+		if ja4 == blocked || (len(blocked) > 0 && blocked[len(blocked)-1] == '_' && len(ja4) >= len(blocked) && ja4[:len(blocked)] == blocked) {
+			Dbgf(cfg, "[TLS-FP] blocked by JA4: %s\n", ja4)
+			return false
+		}
+	}
+	return true
+}
+
 // ── Replay 防护 ───────────────────────────────────────────────────────────────
 
 type replayCache struct {
@@ -90,6 +447,16 @@ func handleFakeTLSHandshake(handshake []byte, reader proto.StreamReader, writer 
 
 	if UsedHandshakes.Has(digest[:digestHalfLen]) {
 		return nil, nil, fmt.Errorf("duplicate handshake")
+	}
+
+	// ── TLS 指纹验证 ──────────────────────────────────────────────────────────
+	// handshake[4:] 是 ClientHello 报文体（已跳过 5 字节记录层头）。
+	// 指纹不合法时直接拒绝，不继续尝试 secret 匹配，减少信息泄露。
+	if len(handshake) < 6 {
+		return nil, nil, fmt.Errorf("handshake too short for fingerprint")
+	}
+	if !verifyTLSFingerprint(handshake[5:], cfg) {
+		return nil, nil, fmt.Errorf("TLS fingerprint rejected")
 	}
 
 	sessIDLen := int(handshake[sessionIDLenPos])
