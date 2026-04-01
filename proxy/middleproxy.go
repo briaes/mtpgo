@@ -261,7 +261,7 @@ func DoDirectHandshake(protoTag []byte, dcIdx int, decKeyAndIV []byte, cfg *conf
 		dc = TGDatacentersV4[dcIdx]
 	}
 
-	addr := fmt.Sprintf("%s:%d", dc, TGDatacenterPort)
+	addr := net.JoinHostPort(dc, fmt.Sprintf("%d", TGDatacenterPort))
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to dc %s: %w", addr, err)
@@ -362,7 +362,7 @@ func DoMiddleproxyHandshake(protoTag []byte, dcIdx int, clIP string, clPort int,
     host := chosen[0].(string)
     port := chosen[1].(int)
 
-    conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
+    conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), 10*time.Second)
     if err != nil {
         return nil, nil, err
     }
