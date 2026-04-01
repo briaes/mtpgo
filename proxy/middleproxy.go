@@ -445,7 +445,7 @@ func encodeIPPort(ip string, port int) []byte {
 	binary.LittleEndian.PutUint32(portBytes, uint32(port))
 
 	if parsed.To4() != nil {
-		out := make([]byte, 10)
+		out := make([]byte, 10, 20)
 		out = append(out, 0xff, 0xff)
 		out = append(out, parsed.To4()...)
 		out = append(out, portBytes...)
