@@ -85,6 +85,59 @@ func getNewProxies(url string) (map[int][][2]interface{}, error) {
 	return ans, nil
 }
 
+// directDCURLs 提供直连 DC 地址的更新来源（Telegram 官方接口）
+const (
+	directDCAddrV4 = "https://core.telegram.org/getProxyConfig"
+	directDCAddrV6 = "https://core.telegram.org/getProxyConfigV6"
+)
+
+// parseDCAddrs 从代理配置中提取 DC IP（格式同 proxy_for）
+func parseDCAddrs(body string) []string {
+	re := regexp.MustCompile(`proxy_for\s+\d+\s+(.+):\d+\s*;`)
+	var ips []string
+	seen := map[string]bool{}
+	for _, m := range re.FindAllStringSubmatch(body, -1) {
+		ip := m[1]
+		if strings.HasPrefix(ip, "[") && strings.HasSuffix(ip, "]") {
+			ip = ip[1 : len(ip)-1]
+		}
+		if !seen[ip] {
+			seen[ip] = true
+			ips = append(ips, ip)
+		}
+	}
+	return ips
+}
+
+// UpdateDirectDCAddrs 从 Telegram 官方接口获取最新的直连 DC 地址并更新本地列表。
+// 修复：直连模式的 DC 地址原先硬编码且从不更新；此函数在后台定期刷新。
+func UpdateDirectDCAddrs() {
+	client := &http.Client{Timeout: 10 * time.Second}
+	for _, item := range []struct {
+		url  string
+		list *[]string
+		mu   *sync.RWMutex
+	}{
+		{directDCAddrV4, &TGDatacentersV4, &TGDirectDCsMu},
+		{directDCAddrV6, &TGDatacentersV6, &TGDirectDCsMu},
+	} {
+		resp, err := client.Get(item.url)
+		if err != nil {
+			Logf("Error fetching DC list from %s: %v\n", item.url, err)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		ips := parseDCAddrs(string(body))
+		if len(ips) > 0 {
+			item.mu.Lock()
+			*item.list = ips
+			item.mu.Unlock()
+			Logf("Updated DC list from %s: %d addresses\n", item.url, len(ips))
+		}
+	}
+}
+
 func UpdateMiddleProxyInfo(cfg *config.Config) {
 	const (
 		proxyInfoAddr   = "https://core.telegram.org/getProxyConfig"
@@ -131,6 +184,9 @@ func UpdateMiddleProxyInfo(cfg *config.Config) {
 				}
 			}
 		}
+
+		// 同步刷新直连 DC 地址（两者使用相同的更新周期）
+		UpdateDirectDCAddrs()
 
 		time.Sleep(time.Duration(cfg.ProxyInfoUpdatePeriod) * time.Second)
 	}
