@@ -16,6 +16,27 @@ import (
 	"mtproxy/crypto"
 )
 
+// proxySecretMu 保护 ProxySecret 的并发读写。
+// ProxySecret 在 middleproxyHandshake（高频读）和 UpdateMiddleProxyInfo（低频写）
+// 中并发访问，必须加锁。
+var proxySecretMu sync.RWMutex
+
+// GetProxySecret 线程安全地读取当前 ProxySecret。
+func GetProxySecret() []byte {
+	proxySecretMu.RLock()
+	defer proxySecretMu.RUnlock()
+	s := make([]byte, len(ProxySecret))
+	copy(s, ProxySecret)
+	return s
+}
+
+// setProxySecret 线程安全地更新 ProxySecret。
+func setProxySecret(newSecret []byte) {
+	proxySecretMu.Lock()
+	defer proxySecretMu.Unlock()
+	ProxySecret = newSecret
+}
+
 // ── 日志 ──────────────────────────────────────────────────────────────────────
 
 var logWriter io.Writer
@@ -92,7 +113,7 @@ func UpdateMiddleProxyInfo(cfg *config.Config) {
 			MiddleProxyMu.Unlock()
 		}
 
-		// 更新 ProxySecret
+		// 更新 ProxySecret（加锁写，防止与 middleproxyHandshake 并发读产生数据竞争）
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Get(proxySecretAddr)
 		if err != nil {
@@ -103,8 +124,9 @@ func UpdateMiddleProxyInfo(cfg *config.Config) {
 			if len(secret) > 0 {
 				newSecret := make([]byte, len(secret))
 				copy(newSecret, secret)
-				if string(newSecret) != string(ProxySecret) {
-					ProxySecret = newSecret
+				current := GetProxySecret()
+				if string(newSecret) != string(current) {
+					setProxySecret(newSecret)
 					Logf("Middle proxy secret updated\n")
 				}
 			}
@@ -171,10 +193,36 @@ func GetMaskHostCertLen(cfg *config.Config) {
 
 // ── IP 缓存清理 ───────────────────────────────────────────────────────────────
 
+// ClearIPResolvingCache 定期主动解析 MaskHost 的 IP，使 Go 运行时的 DNS 缓存
+// 得到刷新。Go 标准库的 DNS 缓存 TTL 约 5 秒（正缓存）/ 2 秒（负缓存），
+// 在长期运行的场景下，主动解析确保 MaskHost IP 变更能及时生效。
 func ClearIPResolvingCache() {
 	for {
 		sleepTime := 60 + crypto.GlobalRand.Intn(60)
 		time.Sleep(time.Duration(sleepTime) * time.Second)
-		// 简单实现：重新获取一次 mask host IP（Go 的 net 包有内置 DNS 缓存处理）
+
+		// 主动解析一次，触发 Go DNS 缓存刷新
+		if maskHost := currentMaskHost(); maskHost != "" {
+			if _, err := net.LookupHost(maskHost); err != nil {
+				Logf("DNS lookup failed for mask host %s: %v\n", maskHost, err)
+			}
+		}
 	}
+}
+
+// currentMaskHost 通过包级变量缓存读取当前 MaskHost，
+// 由 SetMaskHost 在启动时设置，避免循环依赖 config 包。
+var maskHostVal string
+var maskHostMu sync.RWMutex
+
+func SetMaskHost(host string) {
+	maskHostMu.Lock()
+	defer maskHostMu.Unlock()
+	maskHostVal = host
+}
+
+func currentMaskHost() string {
+	maskHostMu.RLock()
+	defer maskHostMu.RUnlock()
+	return maskHostVal
 }
