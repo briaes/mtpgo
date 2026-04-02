@@ -1,83 +1,228 @@
-package crypto
+package proxy
 
 import (
-	"crypto/rand"
-	"encoding/binary"
-	"math/big"
-	mathrand "math/rand"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
+
+	"mtproxy/config"
+	"mtproxy/crypto"
 )
 
-// CryptoRand 是线程安全的加密级随机数生成器
-type CryptoRand struct {
-	mu  sync.Mutex
-	ctr *AESCTR
-	buf []byte
+// proxySecretMu 保护 ProxySecret 的并发读写。
+// ProxySecret 在 middleproxyHandshake（高频读）和 UpdateMiddleProxyInfo（低频写）
+// 中并发访问，必须加锁。
+var proxySecretMu sync.RWMutex
+
+// GetProxySecret 线程安全地读取当前 ProxySecret。
+func GetProxySecret() []byte {
+	proxySecretMu.RLock()
+	defer proxySecretMu.RUnlock()
+	s := make([]byte, len(ProxySecret))
+	copy(s, ProxySecret)
+	return s
 }
 
-func NewCryptoRand() *CryptoRand {
-	key := make([]byte, 32)
-	rand.Read(key)
-	ivBytes := make([]byte, 16)
-	rand.Read(ivBytes)
-	iv := Uint128FromBytes(ivBytes)
-	return &CryptoRand{
-		ctr: NewAESCTR(key, iv),
+// setProxySecret 线程安全地更新 ProxySecret。
+func setProxySecret(newSecret []byte) {
+	proxySecretMu.Lock()
+	defer proxySecretMu.Unlock()
+	ProxySecret = newSecret
+}
+
+// ── 日志 ──────────────────────────────────────────────────────────────────────
+
+var logWriter io.Writer
+
+func SetLogger(w io.Writer) {
+	logWriter = w
+}
+
+func Logf(format string, args ...interface{}) {
+	if logWriter != nil {
+		fmt.Fprintf(logWriter, format, args...)
 	}
 }
 
-func (r *CryptoRand) Bytes(n int) []byte {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	const chunkSize = 512
-	for len(r.buf) < n {
-		plain := make([]byte, chunkSize)
-		rand.Read(plain)
-		r.buf = append(r.buf, r.ctr.Encrypt(plain)...)
+func Dbgf(cfg *config.Config, format string, args ...interface{}) {
+	if cfg != nil && cfg.Debug {
+		Logf(format, args...)
 	}
-	out := make([]byte, n)
-	copy(out, r.buf[:n])
-	r.buf = r.buf[n:]
-	return out
 }
 
-func (r *CryptoRand) Intn(n int) int {
-	b := r.Bytes(8)
-	val := binary.BigEndian.Uint64(b)
-	return int(val % uint64(n))
-}
+// ── 中间代理列表更新 ──────────────────────────────────────────────────────────
 
-func (r *CryptoRand) Choice(s []string) string {
-	return s[r.Intn(len(s))]
-}
-
-// GenX25519PublicKey 生成一个模 P 有平方根的随机数（用于 TLS 伪装）
-func (r *CryptoRand) GenX25519PublicKey() []byte {
-	P := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 255), big.NewInt(19))
-	nBytes := r.Bytes(32)
-	n := new(big.Int).SetBytes(nBytes)
-	n.Mod(n, P)
-	result := new(big.Int).Mul(n, n)
-	result.Mod(result, P)
-	out := make([]byte, 32)
-	resultBytes := result.Bytes()
-	copy(out[32-len(resultBytes):], resultBytes)
-	// little-endian
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
+func getNewProxies(url string) (map[int][][2]interface{}, error) {
+	re := regexp.MustCompile(`proxy_for\s+(-?\d+)\s+(.+):(\d+)\s*;`)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
 	}
-	return out
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	ans := make(map[int][][2]interface{})
+	for _, match := range re.FindAllStringSubmatch(string(body), -1) {
+		dcIdx, _ := strconv.Atoi(match[1])
+		host := match[2]
+		port, _ := strconv.Atoi(match[3])
+		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+			host = host[1 : len(host)-1]
+		}
+		ans[dcIdx] = append(ans[dcIdx], [2]interface{}{host, port})
+	}
+	return ans, nil
 }
 
-// GlobalRand 全局加密随机数生成器实例
-var GlobalRand = NewCryptoRand()
+func UpdateMiddleProxyInfo(cfg *config.Config) {
+	const (
+		proxyInfoAddr   = "https://core.telegram.org/getProxyConfig"
+		proxyInfoAddrV6 = "https://core.telegram.org/getProxyConfigV6"
+		proxySecretAddr = "https://core.telegram.org/getProxySecret"
+	)
 
-// RandHex 生成 n 个随机十六进制字符
-func RandHex(n int) string {
-	const chars = "0123456789abcdef"
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = chars[mathrand.Intn(16)]
+	for {
+		// 更新 IPv4 代理列表
+		v4, err := getNewProxies(proxyInfoAddr)
+		if err != nil || len(v4) == 0 {
+			Logf("Error updating middle proxy list: %v\n", err)
+		} else {
+			MiddleProxyMu.Lock()
+			TGMiddleProxiesV4 = v4
+			MiddleProxyMu.Unlock()
+		}
+
+		// 更新 IPv6 代理列表
+		v6, err := getNewProxies(proxyInfoAddrV6)
+		if err != nil || len(v6) == 0 {
+			Logf("Error updating middle proxy list (IPv6): %v\n", err)
+		} else {
+			MiddleProxyMu.Lock()
+			TGMiddleProxiesV6 = v6
+			MiddleProxyMu.Unlock()
+		}
+
+		// 更新 ProxySecret（加锁写，防止与 middleproxyHandshake 并发读产生数据竞争）
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(proxySecretAddr)
+		if err != nil {
+			Logf("Error updating middle proxy secret: %v\n", err)
+		} else {
+			secret, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if len(secret) > 0 {
+				newSecret := make([]byte, len(secret))
+				copy(newSecret, secret)
+				current := GetProxySecret()
+				if string(newSecret) != string(current) {
+					setProxySecret(newSecret)
+					Logf("Middle proxy secret updated\n")
+				}
+			}
+		}
+
+		time.Sleep(time.Duration(cfg.ProxyInfoUpdatePeriod) * time.Second)
 	}
-	return string(b)
+}
+
+// ── TLS 证书长度获取 ──────────────────────────────────────────────────────────
+
+var FakeCertLen = 2048 // 默认值
+var FakeCertMu sync.RWMutex
+
+func GetMaskHostCertLen(cfg *config.Config) {
+	const getCertTimeout = 10 * time.Second
+	const maskEnablingCheckPeriod = 60 * time.Second
+
+	for {
+		if !cfg.Mask {
+			time.Sleep(maskEnablingCheckPeriod)
+			continue
+		}
+
+		func() {
+			conn, err := tls.DialWithDialer(
+				&net.Dialer{Timeout: getCertTimeout},
+				"tcp",
+				fmt.Sprintf("%s:%d", cfg.MaskHost, cfg.MaskPort),
+				&tls.Config{
+					ServerName:         cfg.TLSDomain,
+					InsecureSkipVerify: true,
+				},
+			)
+			if err != nil {
+				Logf("Failed to connect to MASK_HOST %s: %v\n", cfg.MaskHost, err)
+				return
+			}
+			defer conn.Close()
+
+			// 获取证书原始数据长度
+			state := conn.ConnectionState()
+			if len(state.PeerCertificates) == 0 {
+				Logf("MASK_HOST %s returned no certificates\n", cfg.MaskHost)
+				return
+			}
+			certLen := len(state.PeerCertificates[0].Raw)
+			if certLen < MinCertLen {
+				Logf("MASK_HOST %s cert too short: %d\n", cfg.MaskHost, certLen)
+				return
+			}
+
+			FakeCertMu.Lock()
+			if certLen != FakeCertLen {
+				FakeCertLen = certLen
+				Logf("Got cert from MASK_HOST %s, length: %d\n", cfg.MaskHost, certLen)
+			}
+			FakeCertMu.Unlock()
+		}()
+
+		time.Sleep(time.Duration(cfg.GetCertLenPeriod) * time.Second)
+	}
+}
+
+// ── IP 缓存清理 ───────────────────────────────────────────────────────────────
+
+// ClearIPResolvingCache 定期主动解析 MaskHost 的 IP，使 Go 运行时的 DNS 缓存
+// 得到刷新。Go 标准库的 DNS 缓存 TTL 约 5 秒（正缓存）/ 2 秒（负缓存），
+// 在长期运行的场景下，主动解析确保 MaskHost IP 变更能及时生效。
+func ClearIPResolvingCache() {
+	for {
+		sleepTime := 60 + crypto.GlobalRand.Intn(60)
+		time.Sleep(time.Duration(sleepTime) * time.Second)
+
+		// 主动解析一次，触发 Go DNS 缓存刷新
+		if maskHost := currentMaskHost(); maskHost != "" {
+			if _, err := net.LookupHost(maskHost); err != nil {
+				Logf("DNS lookup failed for mask host %s: %v\n", maskHost, err)
+			}
+		}
+	}
+}
+
+// currentMaskHost 通过包级变量缓存读取当前 MaskHost，
+// 由 SetMaskHost 在启动时设置，避免循环依赖 config 包。
+var maskHostVal string
+var maskHostMu sync.RWMutex
+
+func SetMaskHost(host string) {
+	maskHostMu.Lock()
+	defer maskHostMu.Unlock()
+	maskHostVal = host
+}
+
+func currentMaskHost() string {
+	maskHostMu.RLock()
+	defer maskHostMu.RUnlock()
+	return maskHostVal
 }
