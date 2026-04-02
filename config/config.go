@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"gopkg.in/ini.v1"
 )
@@ -33,10 +35,10 @@ type Modes struct {
 }
 
 type Config struct {
-	Port    int
-	Secrets [][]byte // 所有 secret，每个 16 字节
-	ADTag   []byte
-	Modes   Modes
+	Port      int
+	Secrets   [][]byte // 所有 secret，每个 16 字节
+	ADTag     []byte
+	Modes     Modes
 	TLSDomain string
 
 	UseMiddleProxy bool
@@ -72,9 +74,33 @@ type Config struct {
 	ClientAckTimeout       int
 	IgnoreTimeSkew         bool
 	Debug                  bool
+}
 
-	TOTGBufsize  interface{} // int 或 [3]int
-	TOCltBufsize interface{}
+// ── 并发安全的配置持有者 ──────────────────────────────────────────────────────
+
+// AtomicConfig 用 RWMutex 保护 Config 的并发读写，解决热重载时的数据竞争。
+// 所有 goroutine 通过 Get() 获取当前配置快照，热重载通过 Set() 原子替换。
+type AtomicConfig struct {
+	mu  sync.RWMutex
+	cfg *Config
+}
+
+func NewAtomicConfig(cfg *Config) *AtomicConfig {
+	return &AtomicConfig{cfg: cfg}
+}
+
+// Get 返回当前配置的指针（只读，调用方不得修改）。
+func (a *AtomicConfig) Get() *Config {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.cfg
+}
+
+// Set 原子替换配置，热重载时调用。
+func (a *AtomicConfig) Set(cfg *Config) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cfg = cfg
 }
 
 var secretHexRe = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
@@ -104,9 +130,6 @@ func LoadConfig(path string) (*Config, error) {
 		ClientKeepalive:        10,
 		ClientAckTimeout:       10,
 		FastMode:               true,
-
-		TOTGBufsize:  (1 << 14),
-		TOCltBufsize: (1 << 14),
 	}
 
 	f, err := ini.Load(path)
@@ -188,6 +211,13 @@ func LoadConfig(path string) (*Config, error) {
 			cfg.ADTag = tag
 		}
 	}
+	if key, err2 := sec.GetKey("METRICS_WHITELIST"); err2 == nil {
+		for _, entry := range strings.Split(key.String(), ",") {
+			if e := strings.TrimSpace(entry); e != "" {
+				cfg.MetricsWhitelist = append(cfg.MetricsWhitelist, e)
+			}
+		}
+	}
 
 	// 读取 MODES
 	if key, err2 := sec.GetKey("MODES_CLASSIC"); err2 == nil {
@@ -214,6 +244,21 @@ func LoadConfig(path string) (*Config, error) {
 		b, _ := hex.DecodeString("00000000000000000000000000000000")
 		cfg.Secrets = append(cfg.Secrets, b)
 		fmt.Fprintln(os.Stderr, "警告: 未找到 secret，使用默认值")
+	}
+
+	// 范围校验：端口
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return nil, fmt.Errorf("PORT %d 超出有效范围 1-65535", cfg.Port)
+	}
+	if cfg.MaskPort < 1 || cfg.MaskPort > 65535 {
+		return nil, fmt.Errorf("MASK_PORT %d 超出有效范围 1-65535", cfg.MaskPort)
+	}
+	// 范围校验：超时（秒）
+	if cfg.ClientHandshakeTimeout < 1 {
+		return nil, fmt.Errorf("CLIENT_HANDSHAKE_TIMEOUT 不能小于 1 秒")
+	}
+	if cfg.TGReadTimeout < 1 {
+		return nil, fmt.Errorf("TG_READ_TIMEOUT 不能小于 1 秒")
 	}
 
 	// 默认值推导
@@ -255,10 +300,12 @@ func ParseArgs() (configPath string) {
 	}
 
 	if genSecret {
+		// 修复：使用 crypto/rand 替代 os.Open("/dev/urandom")，跨平台且正确处理错误
 		b := make([]byte, 16)
-		f, _ := os.Open("/dev/urandom")
-		f.Read(b)
-		f.Close()
+		if _, err := rand.Read(b); err != nil {
+			fmt.Fprintf(os.Stderr, "生成随机 secret 失败: %v\n", err)
+			os.Exit(1)
+		}
 		fmt.Println(hex.EncodeToString(b))
 		os.Exit(0)
 	}
