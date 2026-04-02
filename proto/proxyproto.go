@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -8,12 +9,13 @@ import (
 	"strings"
 )
 
-// HandleProxyProtocol 解析 HAProxy PROXY protocol v1/v2
-// 返回真实的客户端地址，出错返回 nil
+// HandleProxyProtocol 解析 HAProxy PROXY protocol v1/v2，返回真实的客户端地址。
 func HandleProxyProtocol(reader StreamReader, peer net.Addr) (net.Addr, error) {
 	const (
 		proxyMinLen  = 6
 		proxy2MinLen = 16
+		// v1 最大行长：108 字节（规范上限）
+		proxy1MaxLine = 108
 	)
 
 	proxySig := []byte("PROXY ")
@@ -24,27 +26,23 @@ func HandleProxyProtocol(reader StreamReader, peer net.Addr) (net.Addr, error) {
 		return nil, err
 	}
 
-	// proxy protocol v1
-	if string(header) == string(proxySig) {
-		// 读到 \r\n
-		var line []byte
-		line = append(line, header...)
-		for {
-			b, err := reader.ReadExactly(1)
-			if err != nil {
-				return nil, err
-			}
-			line = append(line, b...)
-			if len(line) >= 2 && line[len(line)-2] == '\r' && line[len(line)-1] == '\n' {
-				break
-			}
-			if len(line) > 108 {
-				return nil, fmt.Errorf("proxy v1 header too long")
-			}
+	// ── Proxy Protocol v1 ─────────────────────────────────────────────────────
+	if bytes.Equal(header, proxySig) {
+		// 修复：一次读取最大可能的 v1 行（108 字节），再找 \r\n，
+		// 替代原来逐字节读取的低效方式。
+		rest, err := reader.ReadExactly(proxy1MaxLine - proxyMinLen)
+		if err != nil {
+			return nil, err
 		}
+		line := append(header, rest...)
+		idx := bytes.Index(line, []byte("\r\n"))
+		if idx < 0 {
+			return nil, fmt.Errorf("proxy v1 header: no CRLF found")
+		}
+		line = line[:idx]
 
-		// "PROXY TCP4 1.2.3.4 5.6.7.8 1234 5678\r\n"
-		parts := strings.Fields(strings.TrimRight(string(line), "\r\n"))
+		// "PROXY TCP4 1.2.3.4 5.6.7.8 1234 5678"
+		parts := strings.Fields(string(line))
 		if len(parts) < 2 {
 			return nil, fmt.Errorf("bad proxy v1 header")
 		}
@@ -63,14 +61,15 @@ func HandleProxyProtocol(reader StreamReader, peer net.Addr) (net.Addr, error) {
 		return nil, fmt.Errorf("unsupported proxy v1 family: %s", family)
 	}
 
-	// proxy protocol v2 — 先读完 16 字节头
+	// ── Proxy Protocol v2 ─────────────────────────────────────────────────────
+	// 修复：用 bytes.HasPrefix 替代手写的 startsWith 循环
 	rest, err := reader.ReadExactly(proxy2MinLen - proxyMinLen)
 	if err != nil {
 		return nil, err
 	}
 	header = append(header, rest...)
 
-	if !startsWith(header, proxy2Sig) {
+	if !bytes.HasPrefix(header, proxy2Sig) {
 		return nil, fmt.Errorf("unknown proxy protocol")
 	}
 
@@ -85,7 +84,7 @@ func HandleProxyProtocol(reader StreamReader, peer net.Addr) (net.Addr, error) {
 		return nil, err
 	}
 
-	// 0x20 = LOCAL, 0x21 = PROXY
+	// 0x20 = LOCAL（保留原始对端地址），0x21 = PROXY（使用头中地址）
 	if proxyVer == 0x20 {
 		return peer, nil
 	}
@@ -95,21 +94,21 @@ func HandleProxyProtocol(reader StreamReader, peer net.Addr) (net.Addr, error) {
 
 	proxyFam := header[13] >> 4
 	const (
-		af_unspec = 0x0
-		af_inet   = 0x1
-		af_inet6  = 0x2
+		afUnspec = 0x0
+		afInet   = 0x1
+		afInet6  = 0x2
 	)
 
 	switch proxyFam {
-	case af_unspec:
+	case afUnspec:
 		return peer, nil
-	case af_inet:
+	case afInet:
 		if proxyLen >= (4+2)*2 {
 			srcIP := net.IP(addrData[:4])
 			srcPort := int(binary.BigEndian.Uint16(addrData[8:10]))
 			return &net.TCPAddr{IP: srcIP, Port: srcPort}, nil
 		}
-	case af_inet6:
+	case afInet6:
 		if proxyLen >= (16+2)*2 {
 			srcIP := net.IP(addrData[:16])
 			srcPort := int(binary.BigEndian.Uint16(addrData[32:34]))
@@ -118,16 +117,4 @@ func HandleProxyProtocol(reader StreamReader, peer net.Addr) (net.Addr, error) {
 	}
 
 	return nil, fmt.Errorf("bad proxy v2 address data")
-}
-
-func startsWith(data, prefix []byte) bool {
-	if len(data) < len(prefix) {
-		return false
-	}
-	for i, b := range prefix {
-		if data[i] != b {
-			return false
-		}
-	}
-	return true
 }
