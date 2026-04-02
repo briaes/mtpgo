@@ -131,33 +131,42 @@ type FakeTLSWriter struct {
 	Upstream StreamWriter
 }
 
-// drsChunkSize 根据动态记录大小（DRS）策略返回下一个分片大小。
-// 策略模仿真实 TLS 1.3 实现（如 Chrome / BoringSSL）：
-//   - 连接建立初期先发小包（1 个 MSS ≈ 1400 B），让 TCP 慢启动
-//     快速确认可达性；
-//   - 之后指数增长到最大记录 16 384 B；
-//   - 在最大值附近加入 ±512 B 的随机抖动，防止流量特征过于规律。
+// drsChunkSize 根据动态记录大小（DRS）策略返回下一个分片大小，
+// 模仿真实 TLS 1.3（Chrome / BoringSSL）的三阶段行为：
 //
-// remaining 是本次 Write 调用中尚未写出的字节数，
-// written   是本次 Write 调用中已写出的字节数（用于判断阶段）。
-func drsChunkSize(remaining, written int) int {
+//	阶段 1（written == 0）：
+//	  首包约 1 MTU（1400 B），让 TCP 慢启动快速确认可达性。
+//
+//	阶段 2（written < initSize*4，即 < 5600 B）：
+//	  下一块大小 = 上一块大小 × 2，实现指数增长。
+//	  注意：此处 nextSize 基于"上一块实际大小"而非 written 总量，
+//	  由调用方通过 lastChunk 参数传入。
+//
+//	阶段 3（written >= 5600 B）：
+//	  稳定在最大记录 16384 B 附近，加 ±512 B 随机抖动，
+//	  避免固定包长被 DPI 识别。
+//
+// 参数：
+//
+//	remaining  — 本次 Write 中尚未写出的字节数
+//	lastChunk  — 上一块实际写出的字节数（首块传 0）
+func drsChunkSize(remaining, lastChunk int) int {
 	const (
-		initSize = 1400             // 第一阶段：约 1 个 MTU
-		maxSize  = 16384            // TLS 记录最大净荷
-		jitter   = 512              // 最大随机抖动
-		growStep = 2                // 每阶段倍增
+		initSize = 1400  // 阶段1：约 1 个 MTU
+		maxSize  = 16384 // TLS 记录净荷上限（RFC 8446）
+		jitter   = 512   // 阶段3 随机抖动范围
 	)
 
 	var target int
 	switch {
-	case written == 0:
-		// 第一个分片：小包，让对端快速 ACK
+	case lastChunk == 0:
+		// 阶段 1：首包小包
 		target = initSize
-	case written < initSize*4:
-		// 第二阶段：翻倍
-		target = written * growStep
+	case lastChunk < initSize*4:
+		// 阶段 2：上一块翻倍（指数增长）
+		target = lastChunk * 2
 	default:
-		// 稳定阶段：接近最大值，加随机抖动
+		// 阶段 3：稳定阶段，加随机抖动
 		j := crypto.GlobalRand.Intn(jitter*2+1) - jitter // [-512, +512]
 		target = maxSize + j
 	}
@@ -176,8 +185,9 @@ func drsChunkSize(remaining, written int) int {
 
 func (w *FakeTLSWriter) Write(data []byte, extra map[string]bool) error {
 	written := 0
+	lastChunk := 0
 	for written < len(data) {
-		chunkSize := drsChunkSize(len(data)-written, written)
+		chunkSize := drsChunkSize(len(data)-written, lastChunk)
 		chunk := data[written : written+chunkSize]
 		hdr := []byte{0x17, 0x03, 0x03, byte(len(chunk) >> 8), byte(len(chunk))}
 		if err := w.Upstream.Write(hdr, nil); err != nil {
@@ -187,6 +197,7 @@ func (w *FakeTLSWriter) Write(data []byte, extra map[string]bool) error {
 			return err
 		}
 		written += chunkSize
+		lastChunk = chunkSize
 	}
 	return nil
 }
