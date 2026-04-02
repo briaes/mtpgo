@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,11 +24,13 @@ import (
 // ── 日志 ──────────────────────────────────────────────────────────────────────
 
 var logWriter io.Writer = os.Stderr
+var logFile *os.File
 
 func setupLogger() {
 	logDir := filepath.Dir(os.Args[0])
 	logPath := filepath.Join(logDir, "log_mtpgo")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	var err error
+	logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "无法创建日志文件 %s: %v\n", logPath, err)
 		return
@@ -59,14 +62,7 @@ func getNetIface() string {
 
 func newHTTPClient(network, iface string) *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	if iface != "" {
-		dialer.Control = func(net_, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET,
-					syscall.SO_BINDTODEVICE, iface)
-			})
-		}
-	}
+
 	return &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
@@ -97,15 +93,8 @@ func getIPFromURL(client *http.Client, url string) string {
 	return result
 }
 
-func getFirstIP(client *http.Client, urls []string) string {
-	for _, url := range urls {
-		if ip := getIPFromURL(client, url); ip != "" {
-			return ip
-		}
-	}
-	return ""
-}
-
+// initIPInfo 并发探测多个 IP 检测服务，取最快返回的结果。
+// 修复：从串行改为并发，消除最坏情况下 30 秒的启动延迟。
 func initIPInfo(cfg *config.Config) {
 	iface := getNetIface()
 
@@ -121,8 +110,8 @@ func initIPInfo(cfg *config.Config) {
 	clientV4 := newHTTPClient("tcp4", iface)
 	clientV6 := newHTTPClient("tcp6", iface)
 
-	ipv4 := getFirstIP(clientV4, ipURLs)
-	ipv6 := getFirstIP(clientV6, ipURLs)
+	ipv4 := getFirstIPConcurrent(clientV4, ipURLs)
+	ipv6 := getFirstIPConcurrent(clientV6, ipURLs)
 
 	if ipv6 != "" && !strings.Contains(ipv6, ":") {
 		ipv6 = ""
@@ -136,6 +125,24 @@ func initIPInfo(cfg *config.Config) {
 	if ipv4 == "" && ipv6 == "" {
 		logf("Failed to determine your ip\n")
 	}
+}
+
+// getFirstIPConcurrent 并发请求所有 URL，返回最快成功的结果。
+func getFirstIPConcurrent(client *http.Client, urls []string) string {
+	ch := make(chan string, len(urls))
+	for _, url := range urls {
+		url := url
+		go func() {
+			ch <- getIPFromURL(client, url)
+		}()
+	}
+	// 收集结果，返回第一个非空的
+	for range urls {
+		if ip := <-ch; ip != "" {
+			return ip
+		}
+	}
+	return ""
 }
 
 // ── 打印代理链接 ──────────────────────────────────────────────────────────────
@@ -213,7 +220,24 @@ func printTGInfo(cfg *config.Config) []map[string]string {
 
 // ── 服务器启动 ────────────────────────────────────────────────────────────────
 
-func startServers(cfg *config.Config) []io.Closer {
+// acceptLoop 接受新连接并分派到 HandleClientWrapper。
+// wg 用于优雅关闭：每个活跃连接在 wg 中计数，关闭时等待全部完成。
+func acceptLoop(ln net.Listener, acfg *config.AtomicConfig, wg *sync.WaitGroup) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			proxy.HandleClientWrapper(conn, acfg.Get())
+		}()
+	}
+}
+
+func startServers(acfg *config.AtomicConfig, wg *sync.WaitGroup) []io.Closer {
+	cfg := acfg.Get()
 	var listeners []io.Closer
 
 	if cfg.ListenAddrIPv4 != "" {
@@ -224,7 +248,7 @@ func startServers(cfg *config.Config) []io.Closer {
 		} else {
 			logf("Listening on %s\n", addr)
 			listeners = append(listeners, ln)
-			go acceptLoop(ln, cfg)
+			go acceptLoop(ln, acfg, wg)
 		}
 	}
 
@@ -236,7 +260,7 @@ func startServers(cfg *config.Config) []io.Closer {
 		} else {
 			logf("Listening on %s\n", addr)
 			listeners = append(listeners, ln)
-			go acceptLoop(ln, cfg)
+			go acceptLoop(ln, acfg, wg)
 		}
 	}
 
@@ -247,21 +271,11 @@ func startServers(cfg *config.Config) []io.Closer {
 			logf("Failed to listen on unix %s: %v\n", cfg.ListenUnixSock, err)
 		} else {
 			listeners = append(listeners, ln)
-			go acceptLoop(ln, cfg)
+			go acceptLoop(ln, acfg, wg)
 		}
 	}
 
 	return listeners
-}
-
-func acceptLoop(ln net.Listener, cfg *config.Config) {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		go proxy.HandleClientWrapper(conn, cfg)
-	}
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -278,11 +292,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 用 AtomicConfig 包装，解决热重载时的并发读写问题
+	acfg := config.NewAtomicConfig(cfg)
+
 	proxy.UsedHandshakes = proxy.NewReplayCache(cfg.ReplayCheckLen)
 	proxy.ClientIPs = proxy.NewReplayCache(cfg.ClientIPsLen)
 
 	initIPInfo(cfg)
-	proxy.SetMaskHost(cfg.MaskHost) // 初始化 DNS 缓存刷新所需的 MaskHost
+	proxy.SetMaskHost(cfg.MaskHost)
 	currentProxyLinks := printTGInfo(cfg)
 
 	go stats.StatsPrinter(cfg, logf)
@@ -291,16 +308,28 @@ func main() {
 
 	if cfg.UseMiddleProxy {
 		go proxy.UpdateMiddleProxyInfo(cfg)
+	} else {
+		// 直连模式也定期刷新 DC 地址
+		go func() {
+			for {
+				proxy.UpdateDirectDCAddrs()
+				time.Sleep(time.Duration(cfg.ProxyInfoUpdatePeriod) * time.Second)
+			}
+		}()
 	}
 
 	stats.StartMetricsServer(cfg, currentProxyLinks)
 
-	listeners := startServers(cfg)
+	// wg 跟踪所有活跃连接，优雅关闭时等待全部完成
+	var wg sync.WaitGroup
+
+	listeners := startServers(acfg, &wg)
 	if len(listeners) == 0 {
 		logf("没有可用的监听地址，退出\n")
 		os.Exit(1)
 	}
 
+	// 热重载：收到 SIGUSR2 时重新加载配置
 	reloadCh := make(chan os.Signal, 1)
 	signal.Notify(reloadCh, syscall.SIGUSR2)
 	go func() {
@@ -310,20 +339,33 @@ func main() {
 				logf("配置重载失败: %v\n", err)
 				continue
 			}
-			*cfg = *newCfg
-			proxy.UsedHandshakes = proxy.NewReplayCache(cfg.ReplayCheckLen)
-			proxy.SetMaskHost(cfg.MaskHost)
-			currentProxyLinks = printTGInfo(cfg)
+			// 原子替换配置，新连接立即使用新配置，已有连接不受影响
+			acfg.Set(newCfg)
+			proxy.UsedHandshakes = proxy.NewReplayCache(newCfg.ReplayCheckLen)
+			proxy.SetMaskHost(newCfg.MaskHost)
+			currentProxyLinks = printTGInfo(newCfg)
 			logf("Config reloaded\n")
 		}
 	}()
 
+	// 等待退出信号
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
 	logf("Shutting down...\n")
+
+	// 停止接受新连接
 	for _, ln := range listeners {
 		ln.Close()
+	}
+
+	// 等待所有活跃连接处理完毕（优雅关闭）
+	wg.Wait()
+	logf("All connections closed.\n")
+
+	// 安全关闭日志文件，确保缓冲区刷新
+	if logFile != nil {
+		logFile.Close()
 	}
 }
