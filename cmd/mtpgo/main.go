@@ -282,6 +282,7 @@ func main() {
 	proxy.ClientIPs = proxy.NewReplayCache(cfg.ClientIPsLen)
 
 	initIPInfo(cfg)
+	proxy.SetMaskHost(cfg.MaskHost) // 初始化 DNS 缓存刷新所需的 MaskHost
 	currentProxyLinks := printTGInfo(cfg)
 
 	go stats.StatsPrinter(cfg, logf)
@@ -311,6 +312,7 @@ func main() {
 			}
 			*cfg = *newCfg
 			proxy.UsedHandshakes = proxy.NewReplayCache(cfg.ReplayCheckLen)
+			proxy.SetMaskHost(cfg.MaskHost)
 			currentProxyLinks = printTGInfo(cfg)
 			logf("Config reloaded\n")
 		}
