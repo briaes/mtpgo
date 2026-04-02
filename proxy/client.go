@@ -14,14 +14,20 @@ import (
 )
 
 // pipeReaderToWriter 将 rd 的数据转发到 wr，直到 ctx 取消或读写出错。
-// ctx 取消时通过 SetDeadline 使阻塞中的 Read 立即返回，避免 goroutine 挂起。
+// conn 是底层 TCP 连接，ctx 取消时通过 conn.SetDeadline 使阻塞中的 Read
+// 立即返回错误，避免 goroutine 一直挂起。
 func pipeReaderToWriter(ctx context.Context, rd proto.StreamReader, wr proto.StreamWriter,
-	secretHex string, bufSize int, isUpstream bool) {
+	conn net.Conn, secretHex string, bufSize int, isUpstream bool) {
 
 	defer func() { recover() }()
 	stat := stats.GlobalStats.GetOrCreateSecretStat(secretHex)
 
-	// 不再使用 deadline 中断，依赖连接自然关闭或 context 取消后的后续行为
+	// ctx 取消时设置过期 deadline，解除 conn 上阻塞的 Read
+	go func() {
+		<-ctx.Done()
+		conn.SetDeadline(time.Now())
+	}()
+
 	for {
 		data, extra, err := rd.Read(bufSize)
 		if err != nil {
@@ -178,11 +184,11 @@ func HandleClient(conn net.Conn, cfg *config.Config) {
 	start := time.Now()
 	done := make(chan struct{}, 2)
 	go func() {
-		pipeReaderToWriter(ctx, tgReader, cltWriter, hsResult.SecretHex, 1<<17, false)
+		pipeReaderToWriter(ctx, tgReader, cltWriter, tgWriter.GetConn(), hsResult.SecretHex, 1<<17, false)
 		done <- struct{}{}
 	}()
 	go func() {
-		pipeReaderToWriter(ctx, cltReader, tgWriter, hsResult.SecretHex, 1<<17, true)
+		pipeReaderToWriter(ctx, cltReader, tgWriter, conn, hsResult.SecretHex, 1<<17, true)
 		done <- struct{}{}
 	}()
 
