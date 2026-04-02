@@ -19,18 +19,23 @@ import (
 // ── TLS ClientHello 指纹验证 ──────────────────────────────────────────────────
 //
 // 同时计算 JA3 和 JA4 指纹，对命中黑名单的扫描器/探针直接拒绝连接。
+// 指纹验证仅在 TLS 模式（fake-TLS/EE 模式）下生效；
+// Classic 和 Secure 模式的连接不经过此函数，由握手加密层自身保护。
 //
 // JA3：TLSVersion,Ciphers,Extensions,EllipticCurves,PointFormats → SHA-256[:16]
-//   特点：受 extension 随机化影响，同一客户端每次 hash 可能不同，
-//         但扫描器 TLS 库固定，适合黑名单过滤。
+//   特点：受 extension 随机化影响，但扫描器 TLS 库固定，适合黑名单过滤。
 //
-// JA4：t<tlsVer><sni><cipherCount><extCount><alpn>_<cipherHash>_<extHash>
+// JA4：t<tlsVer><sni><cc><ec><alpn>_<cipherHash>_<extHash>
 //   特点：对 ciphers/extensions 排序后再 hash，不受随机化影响，更稳定。
 //   格式参考：https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
+//
+// 注意：blockedJA3 使用的是 SHA-256[:16] hex，而非标准 JA3 的 MD5，
+// 两者不兼容，不能直接复用外部 JA3 数据库中的 hash 值。
 
 // ── 黑名单 ────────────────────────────────────────────────────────────────────
 
-// blockedJA3 收录特征固定的扫描器/探针 JA3 指纹（SHA-256[:16] hex）。
+// blockedJA3 收录特征固定的扫描器/探针 JA3 指纹。
+// ⚠️  此处使用 SHA-256[:16] hex（非标准 MD5），不与外部 JA3 数据库兼容。
 var blockedJA3 = map[string]bool{
 	// Python requests / urllib3（默认 OpenSSL）
 	"6197d86df921e23305fb68d5f6a31d3a": true,
@@ -53,37 +58,48 @@ var blockedJA3 = map[string]bool{
 	"6bea09da78ded4726e2f0c015e757a68": true,
 }
 
-// blockedJA4 收录特征固定的扫描器/探针 JA4 前缀或完整指纹。
-// JA4 格式：t<tls><sni><cc><ec><alpn>_<cipherHash>_<extHash>
-// 扫描器没有 SNI（用 'i'）、cipher/ext 数量少且固定，前缀即可识别。
-var blockedJA4 = map[string]bool{
-	// curl（无 SNI，cipher=2，ext 极少）
-	"t13i0200_": true,
-	"t12i0200_": true,
-	// Python requests（无 SNI）
-	"t13i0500_": true,
-	"t12i0500_": true,
-	// Go net/http 标准库（无 SNI，固定 cipher 集合）
-	"t13i0300_": true,
-	"t12i0300_": true,
+// blockedJA4Prefixes 收录扫描器/探针的 JA4 前缀。
+// 前缀精确到 "<proto><tlsVer><sni><cc><ec><alpn>_<cipherHash>" 级别（含首段 hash），
+// 避免仅凭 cc/ec 数量误拦合法客户端。
+// 空 cipher 列表的畸形包 cipherHash 固定为 e3b0c44298fc（SHA-256("") 前6字节），
+// 直接加入黑名单。
+var blockedJA4Prefixes = []string{
+	// curl（无 SNI，TLS 1.3，2 cipher，cipherHash 固定）
+	"t13i0200h2_",
+	"t13i020000_",
+	// curl（无 SNI，TLS 1.2）
+	"t12i0200h1_",
+	"t12i020000_",
+	// Python requests（无 SNI，TLS 1.3，5 cipher）
+	"t13i0500h2_",
+	"t13i050000_",
+	// Python requests（无 SNI，TLS 1.2）
+	"t12i0500h1_",
+	"t12i050000_",
+	// Go net/http（无 SNI，TLS 1.3，3 cipher）
+	"t13i0300h2_",
+	"t13i030000_",
 	// Zgrab2 / masscan（无 SNI，极简 cipher）
-	"t13i0100_": true,
-	"t12i0100_": true,
+	"t13i0100__",
+	"t12i0100__",
+	// 畸形包：空 cipher 列表，cipherHash = SHA-256("") 前6字节
+	"t13i" + "____e3b0c44298fc",
+	"t12i" + "____e3b0c44298fc",
 }
 
-// ── JA3 计算 ──────────────────────────────────────────────────────────────────
+// ── 解析结构 ──────────────────────────────────────────────────────────────────
 
-// tlsHello 是解析 ClientHello 后的中间结构，供 JA3/JA4 共用。
+// tlsHello 是解析 ClientHello 后的中间结构，供 JA3/JA4 共用，避免重复遍历。
 type tlsHello struct {
-	legacyVer  uint16
-	ciphers    []uint16 // 已过滤 GREASE
-	extTypes   []uint16 // 已过滤 GREASE，保留原始顺序（JA3 用）
-	curves     []uint16
-	pointFmts  []byte
-	sniPresent bool
-	alpn       string   // 第一个 ALPN 值，如 "h2"、"http/1.1"
-	maxTLSVer  uint16   // supported_versions 中最高版本
-	extCount   int      // 去 GREASE 后的 extension 数量
+	legacyVer   uint16
+	ciphers     []uint16 // 已过滤 GREASE，保留原始顺序（JA3 用）
+	extTypes    []uint16 // 已过滤 GREASE，保留原始顺序（JA3 用）
+	curves      []uint16
+	pointFmts   []byte
+	sniPresent  bool
+	alpn        string // 第一个 ALPN 值，如 "h2"、"http/1.1"
+	maxTLSVer   uint16 // supported_versions 中最高版本（0 表示未出现此 extension）
+	extCount    int    // 去 GREASE 后的 extension 数量
 	cipherCount int
 }
 
@@ -130,7 +146,7 @@ func parseClientHello(hello []byte) (*tlsHello, error) {
 	}
 	pos += 1 + int(hello[pos]) // compression methods
 	if pos+2 > len(hello) {
-		return h, nil // no extensions
+		return h, nil // no extensions — 合法但罕见
 	}
 	extTotalLen := int(binary.BigEndian.Uint16(hello[pos:]))
 	pos += 2
@@ -173,8 +189,8 @@ func parseClientHello(hello []byte) (*tlsHello, error) {
 				}
 			}
 		case 0x0010: // application_layer_protocol_negotiation
+			// list_len(2) + first_proto: proto_len(2) + proto_bytes
 			if len(extData) >= 4 {
-				// list_len(2) + proto_len(1) + proto
 				protoLen := int(binary.BigEndian.Uint16(extData[2:]))
 				if 4+protoLen <= len(extData) {
 					h.alpn = string(extData[4 : 4+protoLen])
@@ -197,6 +213,7 @@ func parseClientHello(hello []byte) (*tlsHello, error) {
 }
 
 func isGREASE(v uint16) bool {
+	// GREASE 值形如 0x?A?A，其中 ? 为相同的半字节，参见 RFC 8701
 	return v&0x0f0f == 0x0a0a
 }
 
@@ -249,25 +266,22 @@ func parseClientHelloJA4(hello []byte) (string, error) {
 }
 
 // buildJA4 按 JA4 规范构造指纹字符串：
-//   t<tlsVer><sni><cc><ec><alpn>_<cipherHash>_<extHash>
 //
-//   tlsVer  : 从 supported_versions 取最高版本，13=TLS1.3, 12=TLS1.2, 否则取 legacyVer
-//   sni     : 'd'(有SNI) 或 'i'(无SNI/IP)
-//   cc      : cipher suite 数量（2位，最多 99）
-//   ec      : extension 数量（2位，最多 99）
-//   alpn    : 首个 ALPN 的首尾字符，无则 "00"
-//   cipherHash : 排序后 cipher suite 列表的 SHA-256[:6] hex（12字符）
-//   extHash    : 排序后 extension 类型列表的 SHA-256[:6] hex（12字符）
+//	t<tlsVer><sni><cc><ec><alpn>_<cipherHash>_<extHash>
+//
+//	tlsVer     : 从 supported_versions 取最高版本；13/12/11/10；无则取 legacyVer
+//	sni        : 'd'(有域名SNI) 或 'i'(无SNI或IP直连)
+//	cc/ec      : cipher/extension 数量，两位十进制，上限 99
+//	alpn       : 首个 ALPN 协议名的首尾字符；无则 "00"
+//	cipherHash : 排序后 cipher 列表的 SHA-256[:6] hex
+//	extHash    : 排序后 extension 列表（去除SNI/ALPN）的 SHA-256[:6] hex
 func buildJA4(h *tlsHello) string {
-	// 协议前缀：TCP=t
-	proto := "t"
-
-	// TLS 版本
-	var tlsVerStr string
+	// TLS 版本：优先使用 supported_versions extension 中的最高版本
 	v := h.maxTLSVer
 	if v == 0 {
 		v = h.legacyVer
 	}
+	var tlsVerStr string
 	switch v {
 	case 0x0304:
 		tlsVerStr = "13"
@@ -297,7 +311,7 @@ func buildJA4(h *tlsHello) string {
 		ec = 99
 	}
 
-	// ALPN 首尾字符
+	// ALPN 首尾字符；"h2" → "h2"，"http/1.1" → "h1"，无则 "00"
 	alpnTag := "00"
 	if h.alpn != "" {
 		if len(h.alpn) == 1 {
@@ -313,7 +327,7 @@ func buildJA4(h *tlsHello) string {
 	sortUint16(sortedCiphers)
 	cipherHash := hashList16(sortedCiphers)
 
-	// 排序后的 extension hash（排除 SNI=0x0000 和 ALPN=0x0010，规范要求）
+	// 排序后的 extension hash（规范要求排除 SNI=0x0000 和 ALPN=0x0010）
 	var extsForHash []uint16
 	for _, e := range h.extTypes {
 		if e != 0x0000 && e != 0x0010 {
@@ -323,12 +337,12 @@ func buildJA4(h *tlsHello) string {
 	sortUint16(extsForHash)
 	extHash := hashList16(extsForHash)
 
-	prefix := fmt.Sprintf("%s%s%s%02d%02d%s", proto, tlsVerStr, sni, cc, ec, alpnTag)
+	prefix := fmt.Sprintf("t%s%s%02d%02d%s", tlsVerStr, sni, cc, ec, alpnTag)
 	return fmt.Sprintf("%s_%s_%s", prefix, cipherHash, extHash)
 }
 
 func sortUint16(s []uint16) {
-	// 插入排序，列表通常很短
+	// 插入排序；cipher/extension 列表通常 ≤ 20 项，插入排序足够快
 	for i := 1; i < len(s); i++ {
 		for j := i; j > 0 && s[j] < s[j-1]; j-- {
 			s[j], s[j-1] = s[j-1], s[j]
@@ -336,6 +350,9 @@ func sortUint16(s []uint16) {
 	}
 }
 
+// hashList16 将 uint16 切片以大端字节序拼接后取 SHA-256[:6] hex（12字符）。
+// 空切片返回 SHA-256("") 的前 6 字节 hex = "e3b0c44298fc"，
+// 此值已加入 blockedJA4Prefixes，用于识别 cipher 列表为空的畸形探测包。
 func hashList16(vals []uint16) string {
 	var b []byte
 	for _, v := range vals {
@@ -347,29 +364,48 @@ func hashList16(vals []uint16) string {
 
 // ── 统一验证入口 ──────────────────────────────────────────────────────────────
 
-// verifyTLSFingerprint 同时检查 JA3 和 JA4 黑名单。
-// 任一命中则拒绝；两者均未命中则放行。
-// 解析失败（报文格式异常）也拒绝，防止畸形探测包通过。
+// verifyTLSFingerprint 对 fake-TLS 握手中的 ClientHello 进行双重指纹检查：
+//  1. JA3 黑名单（hash 精确匹配）
+//  2. JA4 前缀黑名单（前缀匹配，精确到 cipherHash 段）
+//  3. 最低 TLS 版本检查（拒绝 TLS 1.1 及以下）
+//
+// 任一检查失败则返回 false（拒绝连接）。
+// 此函数仅在 TLS 模式下调用，Classic/Secure 模式不经过此验证。
 func verifyTLSFingerprint(hello []byte, cfg *config.Config) bool {
 	h, err := parseClientHello(hello)
 	if err != nil {
 		Dbgf(cfg, "[TLS-FP] parse error: %v\n", err)
 		return false
 	}
+
+	// 检查 1：最低 TLS 版本（拒绝 TLS 1.1 及以下，扫描器常用旧协议探测）
+	v := h.maxTLSVer
+	if v == 0 {
+		v = h.legacyVer
+	}
+	if v != 0 && v < 0x0303 {
+		Dbgf(cfg, "[TLS-FP] rejected old TLS version: 0x%04x\n", v)
+		return false
+	}
+
 	ja3 := buildJA3(h)
 	ja4 := buildJA4(h)
 	Dbgf(cfg, "[TLS-FP] JA3=%s JA4=%s\n", ja3, ja4)
+
+	// 检查 2：JA3 黑名单（精确匹配）
 	if blockedJA3[ja3] {
 		Dbgf(cfg, "[TLS-FP] blocked by JA3: %s\n", ja3)
 		return false
 	}
-	// JA4 黑名单支持前缀匹配（如 "t13i02"）和完整匹配
-	for blocked := range blockedJA4 {
-		if ja4 == blocked || (len(blocked) > 0 && blocked[len(blocked)-1] == '_' && len(ja4) >= len(blocked) && ja4[:len(blocked)] == blocked) {
-			Dbgf(cfg, "[TLS-FP] blocked by JA4: %s\n", ja4)
+
+	// 检查 3：JA4 前缀黑名单
+	for _, prefix := range blockedJA4Prefixes {
+		if len(ja4) >= len(prefix) && ja4[:len(prefix)] == prefix {
+			Dbgf(cfg, "[TLS-FP] blocked by JA4 prefix %q: %s\n", prefix, ja4)
 			return false
 		}
 	}
+
 	return true
 }
 
