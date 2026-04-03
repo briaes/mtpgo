@@ -189,11 +189,15 @@ func (w *FakeTLSWriter) Write(data []byte, extra map[string]bool) error {
 	for written < len(data) {
 		chunkSize := drsChunkSize(len(data)-written, lastChunk)
 		chunk := data[written : written+chunkSize]
-		hdr := []byte{0x17, 0x03, 0x03, byte(len(chunk) >> 8), byte(len(chunk))}
-		if err := w.Upstream.Write(hdr, nil); err != nil {
-			return err
-		}
-		if err := w.Upstream.Write(chunk, nil); err != nil {
+		// 将 TLS 记录头（5 字节）和 payload 合并为单次写入，避免拆成两个 TCP 包
+		record := make([]byte, 5+len(chunk))
+		record[0] = 0x17
+		record[1] = 0x03
+		record[2] = 0x03
+		record[3] = byte(len(chunk) >> 8)
+		record[4] = byte(len(chunk))
+		copy(record[5:], chunk)
+		if err := w.Upstream.Write(record, nil); err != nil {
 			return err
 		}
 		written += chunkSize
