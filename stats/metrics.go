@@ -232,3 +232,49 @@ func StartMetricsServer(cfg *config.Config, proxyLinks []map[string]string) {
 		}()
 	}
 }
+
+// StartMetricsServerAtomic 是 StartMetricsServer 的 AtomicConfig 版本。
+// handler 每次请求时通过 atomicCfg.Get() 取得最新配置，热重载后白名单等立即生效。
+// proxyLinks 通过闭包持有指针，热重载时由 main goroutine 更新同一变量。
+func StartMetricsServerAtomic(atomicCfg *config.AtomicConfig, proxyLinks []map[string]string) {
+	cfg := atomicCfg.Get()
+	if cfg.MetricsPort == 0 {
+		return
+	}
+
+	// handler 闭包每次请求时重新 Get()，不缓存 cfg 指针
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		MetricsHandler(atomicCfg.Get(), proxyLinks)(w, r)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handler)
+
+	newServer := func(addr string) *http.Server {
+		return &http.Server{
+			Addr:         addr,
+			Handler:      mux,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 10 * time.Second,
+			IdleTimeout:  30 * time.Second,
+		}
+	}
+
+	if cfg.MetricsListenAddrV4 != "" {
+		addr := fmt.Sprintf("%s:%d", cfg.MetricsListenAddrV4, cfg.MetricsPort)
+		go func() {
+			if err := newServer(addr).ListenAndServe(); err != nil {
+				fmt.Printf("Metrics server error: %v\n", err)
+			}
+		}()
+	}
+
+	if cfg.MetricsListenAddrV6 != "" {
+		addr := fmt.Sprintf("[%s]:%d", cfg.MetricsListenAddrV6, cfg.MetricsPort)
+		go func() {
+			if err := newServer(addr).ListenAndServe(); err != nil {
+				fmt.Printf("Metrics server (v6) error: %v\n", err)
+			}
+		}()
+	}
+}
