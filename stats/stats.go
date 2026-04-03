@@ -112,6 +112,31 @@ func StatsPrinter(cfg *config.Config, logf func(string, ...interface{})) {
 	}
 }
 
+// StatsPrinterAtomic 是 StatsPrinter 的 AtomicConfig 版本。
+// 每次循环迭代时通过 atomicCfg.Get() 取得最新配置，热重载后自动使用新的 StatsPrintPeriod。
+func StatsPrinterAtomic(atomicCfg *config.AtomicConfig, logf func(string, ...interface{})) {
+	for {
+		cfg := atomicCfg.Get()
+		time.Sleep(time.Duration(cfg.StatsPrintPeriod) * time.Second)
+		logf("Stats for %s\n", time.Now().Format("02.01.2006 15:04:05"))
+
+		GlobalStats.Mu.RLock()
+		for secretHex, st := range GlobalStats.SecretStats {
+			total := atomic.LoadInt64(&st.OctetsFromClt) + atomic.LoadInt64(&st.OctetsToClt)
+			logf("%s: %d connects (%d current), %.2f MB, %d msgs\n",
+				secretHex[:8]+"...",
+				atomic.LoadInt64(&st.Connects),
+				atomic.LoadInt64(&st.CurrConnects),
+				float64(total)/1e6,
+				atomic.LoadInt64(&st.MsgsFromClt)+atomic.LoadInt64(&st.MsgsToClt),
+			)
+		}
+		GlobalStats.Mu.RUnlock()
+
+		logf("\n")
+	}
+}
+
 // FormatStats 返回当前统计的文本摘要，供 metrics 和日志共用。
 func FormatStats() string {
 	all := atomic.LoadInt64(&GlobalStats.ConnectsAll)
