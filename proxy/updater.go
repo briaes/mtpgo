@@ -16,8 +16,6 @@ import (
 	"mtproxy/crypto"
 )
 
-const MinCertLen = 1024
-
 // proxySecretMu 保护 ProxySecret 的并发读写。
 // ProxySecret 在 middleproxyHandshake（高频读）和 UpdateMiddleProxyInfo（低频写）
 // 中并发访问，必须加锁。
@@ -39,29 +37,91 @@ func setProxySecret(newSecret []byte) {
 	ProxySecret = newSecret
 }
 
-// ── 日志 ──────────────────────────────────────────────────────────────────────
+// ── 日志系统 ─────────────────────────────────────────────────────────────────
+//
+// 四个级别从低到高：debug < info < warn < error
+// 配置文件通过 LOG_LEVEL 字段控制最低输出级别。
+// 低于当前级别的日志调用直接返回，零开销（无格式化）。
+
+const (
+	LevelDebug = iota
+	LevelInfo
+	LevelWarn
+	LevelError
+)
 
 var logWriter io.Writer
+var logLevel = LevelInfo // 默认 info，由 SetLogLevel 更新
 
 func SetLogger(w io.Writer) {
 	logWriter = w
 }
 
-func Logf(format string, args ...interface{}) {
+// SetLogLevel 将字符串级别转换为内部整数并存储。
+func SetLogLevel(level string) {
+	switch level {
+	case "debug":
+		logLevel = LevelDebug
+	case "info":
+		logLevel = LevelInfo
+	case "warn":
+		logLevel = LevelWarn
+	case "error":
+		logLevel = LevelError
+	default:
+		logLevel = LevelInfo
+	}
+}
+
+func logWrite(format string, args ...interface{}) {
 	if logWriter != nil {
 		fmt.Fprintf(logWriter, format, args...)
 	}
 }
 
-func Dbgf(cfg *config.Config, format string, args ...interface{}) {
-	if cfg != nil && cfg.Debug {
-		Logf(format, args...)
+// Debugf 输出 debug 级别日志，需传入 cfg 以读取当前日志级别。
+// 设计为接受 cfg 而非全局变量，方便热重载后立即生效。
+func Debugf(cfg *config.Config, format string, args ...interface{}) {
+	if cfg != nil && logLevel <= LevelDebug {
+		logWrite("[DEBUG] "+format, args...)
 	}
+}
+
+// Infof 输出 info 级别日志。
+func Infof(format string, args ...interface{}) {
+	if logLevel <= LevelInfo {
+		logWrite("[INFO]  "+format, args...)
+	}
+}
+
+// Warnf 输出 warn 级别日志。
+func Warnf(format string, args ...interface{}) {
+	if logLevel <= LevelWarn {
+		logWrite("[WARN]  "+format, args...)
+	}
+}
+
+// Errorf 输出 error 级别日志。
+func Errorf(format string, args ...interface{}) {
+	if logLevel <= LevelError {
+		logWrite("[ERROR] "+format, args...)
+	}
+}
+
+// Logf 保留作为兼容别名，等同于 Infof。
+// 仅供 stats.StatsPrinter 等传函数指针的场景使用。
+func Logf(format string, args ...interface{}) {
+	Infof(format, args...)
+}
+
+// Dbgf 保留作为兼容别名，等同于 Debugf。
+func Dbgf(cfg *config.Config, format string, args ...interface{}) {
+	Debugf(cfg, format, args...)
 }
 
 // ── 中间代理列表更新 ──────────────────────────────────────────────────────────
 
-func getNewProxies(url string) (map[int][]DCAddr, error) {
+func getNewProxies(url string) (map[int][][2]interface{}, error) {
 	re := regexp.MustCompile(`proxy_for\s+(-?\d+)\s+(.+):(\d+)\s*;`)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
@@ -74,7 +134,7 @@ func getNewProxies(url string) (map[int][]DCAddr, error) {
 		return nil, err
 	}
 
-	ans := make(map[int][]DCAddr)
+	ans := make(map[int][][2]interface{})
 	for _, match := range re.FindAllStringSubmatch(string(body), -1) {
 		dcIdx, _ := strconv.Atoi(match[1])
 		host := match[2]
@@ -82,62 +142,9 @@ func getNewProxies(url string) (map[int][]DCAddr, error) {
 		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
 			host = host[1 : len(host)-1]
 		}
-		ans[dcIdx] = append(ans[dcIdx], DCAddr{Host: host, Port: port})
+		ans[dcIdx] = append(ans[dcIdx], [2]interface{}{host, port})
 	}
 	return ans, nil
-}
-
-// directDCURLs 提供直连 DC 地址的更新来源（Telegram 官方接口）
-const (
-	directDCAddrV4 = "https://core.telegram.org/getProxyConfig"
-	directDCAddrV6 = "https://core.telegram.org/getProxyConfigV6"
-)
-
-// parseDCAddrs 从代理配置中提取 DC IP（格式同 proxy_for）
-func parseDCAddrs(body string) []string {
-	re := regexp.MustCompile(`proxy_for\s+\d+\s+(.+):\d+\s*;`)
-	var ips []string
-	seen := map[string]bool{}
-	for _, m := range re.FindAllStringSubmatch(body, -1) {
-		ip := m[1]
-		if strings.HasPrefix(ip, "[") && strings.HasSuffix(ip, "]") {
-			ip = ip[1 : len(ip)-1]
-		}
-		if !seen[ip] {
-			seen[ip] = true
-			ips = append(ips, ip)
-		}
-	}
-	return ips
-}
-
-// UpdateDirectDCAddrs 从 Telegram 官方接口获取最新的直连 DC 地址并更新本地列表。
-// 修复：直连模式的 DC 地址原先硬编码且从不更新；此函数在后台定期刷新。
-func UpdateDirectDCAddrs() {
-	client := &http.Client{Timeout: 10 * time.Second}
-	for _, item := range []struct {
-		url  string
-		list *[]string
-		mu   *sync.RWMutex
-	}{
-		{directDCAddrV4, &TGDatacentersV4, &TGDirectDCsMu},
-		{directDCAddrV6, &TGDatacentersV6, &TGDirectDCsMu},
-	} {
-		resp, err := client.Get(item.url)
-		if err != nil {
-			Logf("Error fetching DC list from %s: %v\n", item.url, err)
-			continue
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		ips := parseDCAddrs(string(body))
-		if len(ips) > 0 {
-			item.mu.Lock()
-			*item.list = ips
-			item.mu.Unlock()
-			Logf("Updated DC list from %s: %d addresses\n", item.url, len(ips))
-		}
-	}
 }
 
 func UpdateMiddleProxyInfo(cfg *config.Config) {
@@ -151,7 +158,7 @@ func UpdateMiddleProxyInfo(cfg *config.Config) {
 		// 更新 IPv4 代理列表
 		v4, err := getNewProxies(proxyInfoAddr)
 		if err != nil || len(v4) == 0 {
-			Logf("Error updating middle proxy list: %v\n", err)
+			Errorf("Error updating middle proxy list: %v\n", err)
 		} else {
 			MiddleProxyMu.Lock()
 			TGMiddleProxiesV4 = v4
@@ -161,7 +168,7 @@ func UpdateMiddleProxyInfo(cfg *config.Config) {
 		// 更新 IPv6 代理列表
 		v6, err := getNewProxies(proxyInfoAddrV6)
 		if err != nil || len(v6) == 0 {
-			Logf("Error updating middle proxy list (IPv6): %v\n", err)
+			Errorf("Error updating middle proxy list (IPv6): %v\n", err)
 		} else {
 			MiddleProxyMu.Lock()
 			TGMiddleProxiesV6 = v6
@@ -172,7 +179,7 @@ func UpdateMiddleProxyInfo(cfg *config.Config) {
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Get(proxySecretAddr)
 		if err != nil {
-			Logf("Error updating middle proxy secret: %v\n", err)
+			Errorf("Error updating middle proxy secret: %v\n", err)
 		} else {
 			secret, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -182,68 +189,11 @@ func UpdateMiddleProxyInfo(cfg *config.Config) {
 				current := GetProxySecret()
 				if string(newSecret) != string(current) {
 					setProxySecret(newSecret)
-					Logf("Middle proxy secret updated\n")
+					Infof("Middle proxy secret updated\n")
 				}
 			}
 		}
 
-		// 同步刷新直连 DC 地址（两者使用相同的更新周期）
-		UpdateDirectDCAddrs()
-
-		time.Sleep(time.Duration(cfg.ProxyInfoUpdatePeriod) * time.Second)
-	}
-}
-
-// UpdateMiddleProxyInfoAtomic 是 UpdateMiddleProxyInfo 的 AtomicConfig 版本。
-// 每次循环迭代时通过 atomicCfg.Get() 取得最新配置，热重载后自动使用新的更新周期。
-func UpdateMiddleProxyInfoAtomic(atomicCfg *config.AtomicConfig) {
-	const (
-		proxyInfoAddr   = "https://core.telegram.org/getProxyConfig"
-		proxyInfoAddrV6 = "https://core.telegram.org/getProxyConfigV6"
-		proxySecretAddr = "https://core.telegram.org/getProxySecret"
-	)
-
-	for {
-		v4, err := getNewProxies(proxyInfoAddr)
-		if err != nil || len(v4) == 0 {
-			Logf("Error updating middle proxy list: %v\n", err)
-		} else {
-			MiddleProxyMu.Lock()
-			TGMiddleProxiesV4 = v4
-			MiddleProxyMu.Unlock()
-		}
-
-		v6, err := getNewProxies(proxyInfoAddrV6)
-		if err != nil || len(v6) == 0 {
-			Logf("Error updating middle proxy list (IPv6): %v\n", err)
-		} else {
-			MiddleProxyMu.Lock()
-			TGMiddleProxiesV6 = v6
-			MiddleProxyMu.Unlock()
-		}
-
-		client := &http.Client{Timeout: 10 * time.Second}
-		resp, err := client.Get(proxySecretAddr)
-		if err != nil {
-			Logf("Error updating middle proxy secret: %v\n", err)
-		} else {
-			secret, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if len(secret) > 0 {
-				newSecret := make([]byte, len(secret))
-				copy(newSecret, secret)
-				current := GetProxySecret()
-				if string(newSecret) != string(current) {
-					setProxySecret(newSecret)
-					Logf("Middle proxy secret updated\n")
-				}
-			}
-		}
-
-		UpdateDirectDCAddrs()
-
-		// 每次循环末尾重新 Get()，热重载后使用新的 ProxyInfoUpdatePeriod
-		cfg := atomicCfg.Get()
 		time.Sleep(time.Duration(cfg.ProxyInfoUpdatePeriod) * time.Second)
 	}
 }
@@ -274,7 +224,7 @@ func GetMaskHostCertLen(cfg *config.Config) {
 				},
 			)
 			if err != nil {
-				Logf("Failed to connect to MASK_HOST %s: %v\n", cfg.MaskHost, err)
+				Warnf("Failed to connect to MASK_HOST %s: %v\n", cfg.MaskHost, err)
 				return
 			}
 			defer conn.Close()
@@ -282,71 +232,19 @@ func GetMaskHostCertLen(cfg *config.Config) {
 			// 获取证书原始数据长度
 			state := conn.ConnectionState()
 			if len(state.PeerCertificates) == 0 {
-				Logf("MASK_HOST %s returned no certificates\n", cfg.MaskHost)
+				Warnf("MASK_HOST %s returned no certificates\n", cfg.MaskHost)
 				return
 			}
 			certLen := len(state.PeerCertificates[0].Raw)
 			if certLen < MinCertLen {
-				Logf("MASK_HOST %s cert too short: %d\n", cfg.MaskHost, certLen)
+				Warnf("MASK_HOST %s cert too short: %d\n", cfg.MaskHost, certLen)
 				return
 			}
 
 			FakeCertMu.Lock()
 			if certLen != FakeCertLen {
 				FakeCertLen = certLen
-				Logf("Got cert from MASK_HOST %s, length: %d\n", cfg.MaskHost, certLen)
-			}
-			FakeCertMu.Unlock()
-		}()
-
-		time.Sleep(time.Duration(cfg.GetCertLenPeriod) * time.Second)
-	}
-}
-
-// GetMaskHostCertLenAtomic 是 GetMaskHostCertLen 的 AtomicConfig 版本。
-// 每次循环迭代时通过 atomicCfg.Get() 取得最新配置，热重载后 MaskHost/TLSDomain 立即生效。
-func GetMaskHostCertLenAtomic(atomicCfg *config.AtomicConfig) {
-	const getCertTimeout = 10 * time.Second
-	const maskEnablingCheckPeriod = 60 * time.Second
-
-	for {
-		cfg := atomicCfg.Get()
-		if !cfg.Mask {
-			time.Sleep(maskEnablingCheckPeriod)
-			continue
-		}
-
-		func() {
-			conn, err := tls.DialWithDialer(
-				&net.Dialer{Timeout: getCertTimeout},
-				"tcp",
-				fmt.Sprintf("%s:%d", cfg.MaskHost, cfg.MaskPort),
-				&tls.Config{
-					ServerName:         cfg.TLSDomain,
-					InsecureSkipVerify: true,
-				},
-			)
-			if err != nil {
-				Logf("Failed to connect to MASK_HOST %s: %v\n", cfg.MaskHost, err)
-				return
-			}
-			defer conn.Close()
-
-			state := conn.ConnectionState()
-			if len(state.PeerCertificates) == 0 {
-				Logf("MASK_HOST %s returned no certificates\n", cfg.MaskHost)
-				return
-			}
-			certLen := len(state.PeerCertificates[0].Raw)
-			if certLen < MinCertLen {
-				Logf("MASK_HOST %s cert too short: %d\n", cfg.MaskHost, certLen)
-				return
-			}
-
-			FakeCertMu.Lock()
-			if certLen != FakeCertLen {
-				FakeCertLen = certLen
-				Logf("Got cert from MASK_HOST %s, length: %d\n", cfg.MaskHost, certLen)
+				Infof("Got cert from MASK_HOST %s, length: %d\n", cfg.MaskHost, certLen)
 			}
 			FakeCertMu.Unlock()
 		}()
@@ -368,7 +266,7 @@ func ClearIPResolvingCache() {
 		// 主动解析一次，触发 Go DNS 缓存刷新
 		if maskHost := currentMaskHost(); maskHost != "" {
 			if _, err := net.LookupHost(maskHost); err != nil {
-				Logf("DNS lookup failed for mask host %s: %v\n", maskHost, err)
+				Warnf("DNS lookup failed for mask host %s: %v\n", maskHost, err)
 			}
 		}
 	}
