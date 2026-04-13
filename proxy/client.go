@@ -112,14 +112,14 @@ func HandleClient(conn net.Conn, cfg *config.Config) {
 
 	if err != nil {
 		stats.GlobalStats.IncHandshakeTimeouts()
-		Dbgf(cfg, "[DEBUG] handshake failed from %s: %v\n", conn.RemoteAddr(), err)
+		Debugf(cfg, "[DEBUG] handshake failed from %s: %v\n", conn.RemoteAddr(), err)
 		if handshake != nil {
 			HandleBadClient(conn, handshake, cfg)
 		}
 		return
 	}
 
-	Dbgf(cfg, "[DEBUG] handshake OK: proto=%x dc=%d secret=%s\n",
+	Debugf(cfg, "[DEBUG] handshake OK: proto=%x dc=%d secret=%s\n",
 		hsResult.ProtoTag, hsResult.DcIdx, hsResult.SecretHex[:8])
 
 	stat := stats.GlobalStats.GetOrCreateSecretStat(hsResult.SecretHex)
@@ -137,20 +137,20 @@ func HandleClient(conn net.Conn, cfg *config.Config) {
 		if cfg.FastMode {
 			decKeyIV = hsResult.EncKeyIV
 		}
-		Dbgf(cfg, "[DEBUG] connecting to TG dc=%d fastMode=%v\n", hsResult.DcIdx, cfg.FastMode)
+		Debugf(cfg, "[DEBUG] connecting to TG dc=%d fastMode=%v\n", hsResult.DcIdx, cfg.FastMode)
 		tgReader, tgWriter, err = DoDirectHandshake(hsResult.ProtoTag, hsResult.DcIdx, decKeyIV, cfg)
 	} else {
 		clAddr := conn.RemoteAddr().(*net.TCPAddr)
-		Dbgf(cfg, "[DEBUG] connecting via middleproxy dc=%d\n", hsResult.DcIdx)
+		Debugf(cfg, "[DEBUG] connecting via middleproxy dc=%d\n", hsResult.DcIdx)
 		tgReader, tgWriter, err = DoMiddleproxyHandshake(hsResult.ProtoTag, hsResult.DcIdx,
 			clAddr.IP.String(), clAddr.Port, cfg)
 	}
 
 	if err != nil {
-		Dbgf(cfg, "[DEBUG] TG connect failed: %v\n", err)
+		Debugf(cfg, "[DEBUG] TG connect failed: %v\n", err)
 		return
 	}
-	Dbgf(cfg, "[DEBUG] TG connected OK\n")
+	Debugf(cfg, "[DEBUG] TG connected OK\n")
 	defer tgWriter.Abort()
 
 	cltReader := hsResult.Reader
