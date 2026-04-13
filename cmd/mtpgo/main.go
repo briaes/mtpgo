@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,11 +24,13 @@ import (
 // ── 日志 ──────────────────────────────────────────────────────────────────────
 
 var logWriter io.Writer = os.Stderr
+var logFile *os.File
 
 func setupLogger() {
 	logDir := filepath.Dir(os.Args[0])
 	logPath := filepath.Join(logDir, "log_mtpgo")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	var err error
+	logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "无法创建日志文件 %s: %v\n", logPath, err)
 		return
@@ -38,6 +41,11 @@ func setupLogger() {
 func logf(format string, args ...interface{}) {
 	fmt.Fprintf(logWriter, format, args...)
 }
+
+// main 包专用的分级日志辅助，直接写入 logWriter，与 proxy 包共享同一 writer
+func infof(format string, args ...interface{})  { fmt.Fprintf(logWriter, "[INFO]  "+format, args...) }
+func warnf(format string, args ...interface{})  { fmt.Fprintf(logWriter, "[WARN]  "+format, args...) }
+func errorf(format string, args ...interface{}) { fmt.Fprintf(logWriter, "[ERROR] "+format, args...) }
 
 // ── 获取公网 IP ───────────────────────────────────────────────────────────────
 
@@ -97,18 +105,59 @@ func getIPFromURL(client *http.Client, url string) string {
 	return result
 }
 
-func getFirstIP(client *http.Client, urls []string) string {
+// getFirstIPConcurrent 并发请求所有 URL，返回最快成功的结果。
+// 修复：第一个结果返回后立即取消其余请求，不让输掉的 goroutine 继续等待。
+func getFirstIPConcurrent(client *http.Client, urls []string) string {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // 确保函数返回时所有未完成请求都被取消
+
+	type result struct{ ip string }
+	ch := make(chan result, len(urls))
+
 	for _, url := range urls {
-		if ip := getIPFromURL(client, url); ip != "" {
-			return ip
+		url := url
+		go func() {
+			// 用带 ctx 的请求，cancel() 后会立即中断
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				ch <- result{""}
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				ch <- result{""}
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				ch <- result{""}
+				return
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				ch <- result{""}
+				return
+			}
+			ip := strings.TrimSpace(string(body))
+			if net.ParseIP(ip) == nil {
+				ip = ""
+			}
+			ch <- result{ip}
+		}()
+	}
+
+	for range urls {
+		if r := <-ch; r.ip != "" {
+			cancel() // 立即取消其余请求
+			return r.ip
 		}
 	}
 	return ""
 }
 
+// initIPInfo 并发探测多个 IP 检测服务，取最快返回的结果。
 func initIPInfo(cfg *config.Config) {
 	iface := getNetIface()
-
 	ipURLs := []string{
 		"http://ip.gs",
 		"http://ip.sb",
@@ -121,20 +170,19 @@ func initIPInfo(cfg *config.Config) {
 	clientV4 := newHTTPClient("tcp4", iface)
 	clientV6 := newHTTPClient("tcp6", iface)
 
-	ipv4 := getFirstIP(clientV4, ipURLs)
-	ipv6 := getFirstIP(clientV6, ipURLs)
+	ipv4 := getFirstIPConcurrent(clientV4, ipURLs)
+	ipv6 := getFirstIPConcurrent(clientV6, ipURLs)
 
 	if ipv6 != "" && !strings.Contains(ipv6, ":") {
 		ipv6 = ""
 	}
-
 	proxy.MyIPInfo.Set(ipv4, ipv6)
 
 	if ipv6 != "" && (cfg.PreferIPv6 || ipv4 == "") {
-		logf("IPv6 found, using it for external communication\n")
+		infof("IPv6 found, using it for external communication\n")
 	}
 	if ipv4 == "" && ipv6 == "" {
-		logf("Failed to determine your ip\n")
+		warnf("Failed to determine your ip\n")
 	}
 }
 
@@ -154,7 +202,7 @@ func printTGInfo(cfg *config.Config) []map[string]string {
 			ipAddrs = append(ipAddrs, ipv6)
 		}
 		if len(ipAddrs) == 0 {
-			logf("Warning: could not determine public IP\n")
+			warnf("Warning: could not determine public IP\n")
 			return nil
 		}
 	}
@@ -175,7 +223,7 @@ func printTGInfo(cfg *config.Config) []map[string]string {
 				link := fmt.Sprintf("https://t.me/proxy?server=%s&port=%d&secret=%s",
 					ip, cfg.Port, secretHex)
 				links = append(links, map[string]string{"secret": secretHex, "link": link})
-				logf("\033[31mMtproxyurl: %s\033[0m\n", link)
+				infof("\033[31mMtproxyurl: %s\033[0m\n", link)
 			}
 			if cfg.Modes.Secure {
 				link := fmt.Sprintf("https://t.me/proxy?server=%s&port=%d&secret=dd%s",
@@ -191,44 +239,57 @@ func printTGInfo(cfg *config.Config) []map[string]string {
 				logf("\033[31mMtproxyurl: %s\033[0m\n", link)
 			}
 		}
-
 		if defaultSecrets[secretHex] {
-			logf("The default secret %s is used, this is not recommended\n", secretHex)
+			warnf("The default secret %s is used, this is not recommended\n", secretHex)
 			rnd := crypto.GlobalRand.Bytes(16)
-			logf("You can change it to this random secret: %s\n", hex.EncodeToString(rnd))
+			infof("You can change it to this random secret: %s\n", hex.EncodeToString(rnd))
 			printDefault = true
 		}
 	}
 
 	if cfg.TLSDomain == "www.google.com" {
-		logf("The default TLS_DOMAIN www.google.com is used, this is not recommended\n")
+		warnf("The default TLS_DOMAIN www.google.com is used, this is not recommended\n")
 		printDefault = true
 	}
 	if printDefault {
-		logf("Warning: one or more default settings detected\n")
+		warnf("Warning: one or more default settings detected\n")
 	}
-
 	return links
 }
 
 // ── 服务器启动 ────────────────────────────────────────────────────────────────
 
-// startServers 启动所有监听器并返回它们的 Closer 列表。
-// 接受 *config.AtomicConfig 而非裸 *config.Config，确保 acceptLoop 中的每个连接
-// 都能通过 atomicCfg.Get() 拿到最新配置快照，热重载后新连接立即使用新配置。
-func startServers(atomicCfg *config.AtomicConfig) []io.Closer {
-	cfg := atomicCfg.Get()
+// shutdownTimeout 是优雅关闭的最长等待时间。
+// 超过此时间后，仍有活跃连接也强制退出，避免因长连接导致进程无法停止。
+const shutdownTimeout = 5 * time.Second
+
+func acceptLoop(ln net.Listener, acfg *config.AtomicConfig, wg *sync.WaitGroup) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			proxy.HandleClientWrapper(conn, acfg.Get())
+		}()
+	}
+}
+
+func startServers(acfg *config.AtomicConfig, wg *sync.WaitGroup) []io.Closer {
+	cfg := acfg.Get()
 	var listeners []io.Closer
 
 	if cfg.ListenAddrIPv4 != "" {
 		addr := fmt.Sprintf("%s:%d", cfg.ListenAddrIPv4, cfg.Port)
 		ln, err := net.Listen("tcp4", addr)
 		if err != nil {
-			logf("Failed to listen on %s: %v\n", addr, err)
+			errorf("Failed to listen on %s: %v\n", addr, err)
 		} else {
-			logf("Listening on %s\n", addr)
+			infof("Listening on %s\n", addr)
 			listeners = append(listeners, ln)
-			go acceptLoop(ln, atomicCfg)
+			go acceptLoop(ln, acfg, wg)
 		}
 	}
 
@@ -236,11 +297,11 @@ func startServers(atomicCfg *config.AtomicConfig) []io.Closer {
 		addr := fmt.Sprintf("[%s]:%d", cfg.ListenAddrIPv6, cfg.Port)
 		ln, err := net.Listen("tcp6", addr)
 		if err != nil {
-			logf("Failed to listen on %s: %v\n", addr, err)
+			errorf("Failed to listen on %s: %v\n", addr, err)
 		} else {
-			logf("Listening on %s\n", addr)
+			infof("Listening on %s\n", addr)
 			listeners = append(listeners, ln)
-			go acceptLoop(ln, atomicCfg)
+			go acceptLoop(ln, acfg, wg)
 		}
 	}
 
@@ -248,29 +309,14 @@ func startServers(atomicCfg *config.AtomicConfig) []io.Closer {
 		os.Remove(cfg.ListenUnixSock)
 		ln, err := net.Listen("unix", cfg.ListenUnixSock)
 		if err != nil {
-			logf("Failed to listen on unix %s: %v\n", cfg.ListenUnixSock, err)
+			errorf("Failed to listen on unix %s: %v\n", cfg.ListenUnixSock, err)
 		} else {
 			listeners = append(listeners, ln)
-			go acceptLoop(ln, atomicCfg)
+			go acceptLoop(ln, acfg, wg)
 		}
 	}
 
 	return listeners
-}
-
-// acceptLoop 持续接受新连接，每次连接时通过 atomicCfg.Get() 取得当前配置快照。
-// 这样热重载后新建立的连接会使用新配置，已有连接不受影响（符合预期语义）。
-func acceptLoop(ln net.Listener, atomicCfg *config.AtomicConfig) {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		// 每次 Accept 后取一次配置快照，传给 HandleClientWrapper。
-		// HandleClientWrapper 内部是单次连接的完整生命周期，使用快照即可，
-		// 无需在连接过程中感知配置变更。
-		go proxy.HandleClientWrapper(conn, atomicCfg.Get())
-	}
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -283,13 +329,13 @@ func main() {
 
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
-		logf("配置加载失败: %v\n", err)
+		errorf("配置加载失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 用 AtomicConfig 统一管理配置，所有 goroutine 通过它读写，保证热重载的并发安全。
-	atomicCfg := config.NewAtomicConfig(cfg)
+	acfg := config.NewAtomicConfig(cfg)
 
+	proxy.SetLogLevel(cfg.LogLevel)
 	proxy.UsedHandshakes = proxy.NewReplayCache(cfg.ReplayCheckLen)
 	proxy.ClientIPs = proxy.NewReplayCache(cfg.ClientIPsLen)
 
@@ -297,22 +343,23 @@ func main() {
 	proxy.SetMaskHost(cfg.MaskHost)
 	currentProxyLinks := printTGInfo(cfg)
 
-	// 后台 goroutine 传入 atomicCfg，内部通过 Get() 读取最新配置。
-	// StatsPrinter / GetMaskHostCertLen / UpdateMiddleProxyInfo 都是长期循环，
-	// 热重载后它们在下一次循环迭代时会自动拿到新配置。
-	go stats.StatsPrinterAtomic(atomicCfg, logf)
-	go proxy.GetMaskHostCertLenAtomic(atomicCfg)
+	go stats.StatsPrinter(cfg, logf)
+	go proxy.GetMaskHostCertLen(cfg)
 	go proxy.ClearIPResolvingCache()
 
 	if cfg.UseMiddleProxy {
-		go proxy.UpdateMiddleProxyInfoAtomic(atomicCfg)
+		go proxy.UpdateMiddleProxyInfo(cfg)
 	}
+	// 直连模式使用硬编码的 DC 地址列表（TGDatacentersV4/V6），
+	// Telegram 官方未提供专门的直连 DC 地址更新接口，无需定期刷新。
 
-	stats.StartMetricsServerAtomic(atomicCfg, currentProxyLinks)
+	stats.StartMetricsServer(cfg, currentProxyLinks)
 
-	listeners := startServers(atomicCfg)
+	var wg sync.WaitGroup
+
+	listeners := startServers(acfg, &wg)
 	if len(listeners) == 0 {
-		logf("没有可用的监听地址，退出\n")
+		errorf("没有可用的监听地址，退出\n")
 		os.Exit(1)
 	}
 
@@ -322,25 +369,46 @@ func main() {
 		for range reloadCh {
 			newCfg, err := config.LoadConfig(configPath)
 			if err != nil {
-				logf("配置重载失败: %v\n", err)
+				errorf("配置重载失败: %v\n", err)
 				continue
 			}
-			// Set 内部用写锁原子替换指针，不存在半更新状态。
-			atomicCfg.Set(newCfg)
-			// 重置 ReplayCache（新配置可能改变了 ReplayCheckLen）
+			acfg.Set(newCfg)
+			proxy.SetLogLevel(newCfg.LogLevel)
 			proxy.UsedHandshakes = proxy.NewReplayCache(newCfg.ReplayCheckLen)
 			proxy.SetMaskHost(newCfg.MaskHost)
 			currentProxyLinks = printTGInfo(newCfg)
-			logf("Config reloaded\n")
+			infof("Config reloaded\n")
 		}
 	}()
 
+	// 等待退出信号
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	logf("Shutting down...\n")
+	infof("Shutting down...\n")
+
+	// 停止接受新连接
 	for _, ln := range listeners {
 		ln.Close()
+	}
+
+	// 等待活跃连接结束，但最多等待 shutdownTimeout。
+	// 超时后强制退出，避免长连接导致进程无法停止。
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		infof("All connections closed.\n")
+	case <-time.After(shutdownTimeout):
+		warnf("Shutdown timeout (%s), forcing exit.\n", shutdownTimeout)
+	}
+
+	if logFile != nil {
+		logFile.Close()
 	}
 }
