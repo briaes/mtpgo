@@ -73,7 +73,7 @@ type Config struct {
 	ClientKeepalive        int
 	ClientAckTimeout       int
 	IgnoreTimeSkew         bool
-	Debug                  bool
+	LogLevel               string // debug / info / warn / error
 }
 
 // ── 并发安全的配置持有者 ──────────────────────────────────────────────────────
@@ -130,6 +130,7 @@ func LoadConfig(path string) (*Config, error) {
 		ClientKeepalive:        10,
 		ClientAckTimeout:       10,
 		FastMode:               true,
+		LogLevel:               "info",
 	}
 
 	f, err := ini.Load(path)
@@ -169,8 +170,14 @@ func LoadConfig(path string) (*Config, error) {
 	if key, err2 := sec.GetKey("IGNORE_TIME_SKEW"); err2 == nil {
 		cfg.IgnoreTimeSkew, _ = key.Bool()
 	}
-	if key, err2 := sec.GetKey("DEBUG"); err2 == nil {
-		cfg.Debug, _ = key.Bool()
+	if key, err2 := sec.GetKey("LOG_LEVEL"); err2 == nil {
+		v := strings.ToLower(strings.TrimSpace(key.String()))
+		switch v {
+		case "debug", "info", "warn", "error":
+			cfg.LogLevel = v
+		default:
+			return nil, fmt.Errorf("LOG_LEVEL 无效值 %q，支持: debug/info/warn/error", v)
+		}
 	}
 	if key, err2 := sec.GetKey("LISTEN_ADDR_IPV4"); err2 == nil {
 		cfg.ListenAddrIPv4 = key.String()
